@@ -94,6 +94,17 @@ actions tied to the current ChatGPT user. Leave public content anonymous.
 - `npm test`: build the starter and verify its rendered loading skeleton
 - `npm run db:generate`: generate Drizzle migrations after schema changes
 
+## Image Lab
+
+The standalone text-to-image workspace is available at `/image-generator`.
+Start the whiteboard backend and web app as usual, then open
+`http://localhost:13000/image-generator`. The page reads the image model and
+provider settings from the main page's `API 设置`. Optional `image_base_url`
+and `image_api_key` override the shared endpoint and key independently; an
+image-only key is sufficient for standalone image generation. The page does
+not have a second model selector or a separate browser-side key. Optionally select a
+style from the shared style library, write a prompt, and generate a downloadable PNG.
+
 ## Learn More
 
 - [vinext Documentation](https://github.com/cloudflare/vinext)
