@@ -12,24 +12,32 @@ import subprocess
 import sys
 import threading
 import time
+import tempfile
 import uuid
 from pathlib import Path
 from typing import Any
 
 import httpx
+import yaml
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from gradio_client import Client, handle_file
 
 
-ROOT = Path(__file__).resolve().parents[1]
-STATE_DIR = ROOT / ".webapp"
+ROOT = Path(os.environ.get("CS_BOARD_ROOT", Path(__file__).resolve().parents[1])).expanduser().resolve()
+STATE_DIR = Path(
+    os.environ.get("CS_BOARD_STATE_DIR", str(ROOT / ".webapp"))
+).expanduser().resolve()
 JOBS_DIR = STATE_DIR / "jobs"
+VOICES_DIR = STATE_DIR / "voices"
+STYLES_DIR = STATE_DIR / "styles"
 CONFIG_PATH = STATE_DIR / "config.json"
 PREFERENCES_PATH = STATE_DIR / "preferences.json"
+STYLES_PATH = STATE_DIR / "styles.json"
+PRONUNCIATION_PATH = ROOT / "pronunciation.yaml"
 PYTHON = Path(sys.executable)
-NODE = shutil.which("node") or "node"
+NODE = os.environ.get("CS_BOARD_NODE", shutil.which("node") or "node")
 REMOTION_RENDERER = ROOT / "video_renderer"
 HAND = ROOT / "assets" / "drawing-hand-clean.png"
 PIPELINE_VERSION = "narrated_deck_v8_oil_visual"
@@ -49,9 +57,32 @@ DEFAULT_CONFIG = {
     "tts_url": "http://127.0.0.1:7860",
     "tts_url_2": "",
     "tts_mode": "gradio",
+    "tts_emotion_mode": 0,
+    "tts_emotion_weight": 0.65,
+    "tts_emotion_vectors": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+    "tts_emotion_text": "",
+    "tts_emotion_random": False,
+    "tts_do_sample": True,
+    "tts_top_p": 0.8,
+    "tts_top_k": 30,
+    "tts_temperature": 0.8,
+    "tts_length_penalty": 0.0,
+    "tts_num_beams": 3,
+    "tts_repetition_penalty": 10.0,
+    "tts_max_mel_tokens": 1500,
+    "tts_max_text_tokens_per_segment": 120,
+    "output_dir": "",
 }
 
 DEFAULT_STYLE = "极简粗线简笔白板风"
+DEFAULT_ASPECT_RATIO = "16:9"
+STYLE_ID_PATTERN = re.compile(r"[A-Za-z0-9_-]{8,32}")
+STYLE_IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp"}
+ASPECT_RATIO_SPECS: dict[str, dict[str, Any]] = {
+    "16:9": {"width": 16, "height": 9, "image_size": "1536x1024", "canvas_size": (1536, 864)},
+    "9:16": {"width": 9, "height": 16, "image_size": "1024x1536", "canvas_size": (864, 1536)},
+    "1:1": {"width": 1, "height": 1, "image_size": "1024x1024", "canvas_size": (1024, 1024)},
+}
 INFOGRAPHIC_STYLE = "国风动态信息图"
 STYLE_PRESETS = {
     INFOGRAPHIC_STYLE: (
@@ -127,10 +158,225 @@ STYLE_PRESETS = {
 }
 
 
+BUILTIN_STYLE_DEFINITIONS = [
+    {
+        "id": "builtin-infographic",
+        "name": INFOGRAPHIC_STYLE,
+        "description": "知识卡片 · 关系结构 · 国风淡彩",
+        "image_url": "/styles/minimal-whiteboard.webp",
+    },
+    {
+        "id": "builtin-minimal-whiteboard",
+        "name": "极简粗线简笔白板风",
+        "description": "粗黑线 · 少量配色 · 清爽留白",
+        "image_url": "/styles/minimal-whiteboard.webp",
+    },
+    {
+        "id": "builtin-business-doodle",
+        "name": "极简商务涂鸦风",
+        "description": "几何图表 · 蓝绿配色 · 专业克制",
+        "image_url": "/styles/business-doodle.webp",
+    },
+    {
+        "id": "builtin-warm-pencil",
+        "name": "暖米黄素描白板风",
+        "description": "铅笔排线 · 纸张质感 · 温暖细腻",
+        "image_url": "/styles/warm-pencil.webp",
+    },
+    {
+        "id": "builtin-guofeng-flat",
+        "name": "粗线扁平国风卡通",
+        "description": "朱红玉绿 · 国风纹样 · 生动平涂",
+        "image_url": "/styles/guofeng-flat.webp",
+    },
+    {
+        "id": "builtin-viral-pop",
+        "name": "爆款高热吸睛风",
+        "description": "高饱和 · 强对比 · 短视频冲击力",
+        "image_url": "/styles/viral-pop.webp",
+    },
+    {
+        "id": "builtin-black-gold-tech",
+        "name": "黑金科技发布会风",
+        "description": "黑金光效 · 科技舞台 · 高级权威",
+        "image_url": "/styles/black-gold-tech.webp",
+    },
+    {
+        "id": "builtin-healing-journal",
+        "name": "清新治愈手账风",
+        "description": "柔和水彩 · 治愈配色 · 生活手账",
+        "image_url": "/styles/healing-journal.webp",
+    },
+    {
+        "id": "builtin-retro-collage",
+        "name": "复古报纸拼贴风",
+        "description": "撕纸拼贴 · 半色调 · 编辑视觉",
+        "image_url": "/styles/retro-collage.webp",
+    },
+    {
+        "id": "builtin-paper-metaphor",
+        "name": "纸感隐喻拼贴风",
+        "description": "手工剪纸 · 观点隐喻 · 高级克制",
+        "image_url": "/styles/paper-metaphor.png",
+    },
+    {
+        "id": "builtin-oil-visual",
+        "name": "漫画墨线解释风",
+        "description": "漫画墨线 · 半调网点 · 概念机制",
+        "image_url": "/styles/oil-visual.png",
+    },
+    {
+        "id": "builtin-clay-3d",
+        "name": "3D黏土趣味风",
+        "description": "黏土材质 · 玩具比例 · 温暖可爱",
+        "image_url": "/styles/clay-3d.webp",
+    },
+    {
+        "id": "builtin-cyber-neon",
+        "name": "赛博霓虹漫画风",
+        "description": "霓虹青紫 · 漫画速度线 · 未来感",
+        "image_url": "/styles/cyber-neon.webp",
+    },
+]
+BUILTIN_STYLE_BY_ID = {item["id"]: item for item in BUILTIN_STYLE_DEFINITIONS}
+
+
 def style_recipe(style: str) -> str:
-    if style not in STYLE_PRESETS:
-        raise RuntimeError(f"后台未加载画面风格：{style}，请重启后台后重新提交任务")
-    return STYLE_PRESETS[style]
+    for item in load_custom_styles():
+        if item.get("name") == style or style in item.get("aliases", []):
+            return str(item.get("recipe") or "")
+    if style in STYLE_PRESETS:
+        return STYLE_PRESETS[style]
+    raise RuntimeError(f"后台未加载画面风格：{style}，请重启后台后重新提交任务")
+
+
+def normalized_style_name(value: Any) -> str:
+    return re.sub(r"\s+", " ", str(value or "")).strip()[:40]
+
+
+def normalized_style_description(value: Any) -> str:
+    return re.sub(r"\s+", " ", str(value or "")).strip()[:100]
+
+
+def normalized_style_recipe(value: Any) -> str:
+    return re.sub(r"\s+", " ", str(value or "")).strip()[:2000]
+
+
+def load_custom_styles() -> list[dict[str, Any]]:
+    if not STYLES_PATH.exists():
+        return []
+    try:
+        data = json.loads(STYLES_PATH.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return []
+    if not isinstance(data, list):
+        return []
+    result: list[dict[str, Any]] = []
+    for item in data:
+        if not isinstance(item, dict):
+            continue
+        style_id = str(item.get("id") or "")
+        name = normalized_style_name(item.get("name"))
+        recipe = normalized_style_recipe(item.get("recipe"))
+        if not STYLE_ID_PATTERN.fullmatch(style_id) or not name or not recipe:
+            continue
+        image_filename = str(item.get("image_filename") or "")
+        if Path(image_filename).name != image_filename:
+            image_filename = ""
+        result.append({
+            "id": style_id,
+            "name": name,
+            "aliases": [normalized_style_name(alias) for alias in item.get("aliases", []) if normalized_style_name(alias)],
+            "description": normalized_style_description(item.get("description")),
+            "recipe": recipe,
+            "image_filename": image_filename,
+            "deleted": bool(item.get("deleted", False)),
+            "builtin": bool(item.get("builtin", False)) and style_id in BUILTIN_STYLE_BY_ID,
+            "created_at": float(item.get("created_at", 0)),
+            "updated_at": float(item.get("updated_at", item.get("created_at", 0))),
+        })
+    return result
+
+
+def save_custom_styles(items: list[dict[str, Any]]) -> None:
+    STATE_DIR.mkdir(exist_ok=True)
+    atomic_write_json(STYLES_PATH, items)
+
+
+def builtin_style_record(definition: dict[str, str]) -> dict[str, Any]:
+    return {
+        "id": definition["id"],
+        "name": definition["name"],
+        "aliases": [],
+        "description": definition["description"],
+        "recipe": STYLE_PRESETS[definition["name"]],
+        "image_filename": "",
+        "deleted": False,
+        "builtin": True,
+        "created_at": 0.0,
+        "updated_at": 0.0,
+    }
+
+
+def builtin_style_records(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    overrides = {str(item.get("id")): item for item in items if item.get("builtin")}
+    records: list[dict[str, Any]] = []
+    for definition in BUILTIN_STYLE_DEFINITIONS:
+        record = builtin_style_record(definition)
+        override = overrides.get(definition["id"])
+        if override:
+            record.update(override)
+            record["id"] = definition["id"]
+            record["builtin"] = True
+        records.append(record)
+    return records
+
+
+def all_style_records(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return builtin_style_records(items) + [item for item in items if not item.get("builtin")]
+
+
+def style_name_conflicts(name: str, items: list[dict[str, Any]], exclude_id: str = "") -> bool:
+    return any(
+        candidate.get("id") != exclude_id
+        and (candidate.get("name") == name or name in candidate.get("aliases", []))
+        for candidate in all_style_records(items)
+    )
+
+
+def style_snapshot(item: dict[str, Any]) -> dict[str, Any]:
+    image_filename = str(item.get("image_filename") or "")
+    image_path = STYLES_DIR / str(item.get("id")) / image_filename
+    definition = BUILTIN_STYLE_BY_ID.get(str(item.get("id")))
+    image_url = (
+        definition["image_url"]
+        if item.get("builtin") and definition
+        else f"/api/styles/{item.get('id')}/image" if image_filename and image_path.is_file() else "/styles/minimal-whiteboard.webp"
+    )
+    return {
+        "id": str(item.get("id")),
+        "name": normalized_style_name(item.get("name")),
+        "aliases": [normalized_style_name(alias) for alias in item.get("aliases", []) if normalized_style_name(alias)],
+        "description": normalized_style_description(item.get("description")),
+        "recipe": normalized_style_recipe(item.get("recipe")),
+        "image_filename": image_filename,
+        "deleted": bool(item.get("deleted", False)),
+        "builtin": bool(item.get("builtin")),
+        "custom": not bool(item.get("builtin")),
+        "type": "内置风格" if item.get("builtin") else "自定义风格",
+        "image_url": image_url,
+        "created_at": float(item.get("created_at", 0)),
+        "updated_at": float(item.get("updated_at", item.get("created_at", 0))),
+    }
+
+
+def builtin_style_image_path(definition: dict[str, str]) -> Path | None:
+    relative_path = definition["image_url"].lstrip("/")
+    candidates = (
+        ROOT / "web" / "public" / relative_path,
+        ROOT / "web" / "dist" / "client" / relative_path,
+    )
+    return next((path for path in candidates if path.is_file()), None)
 
 
 def is_infographic_job(job_id: str) -> bool:
@@ -229,6 +475,7 @@ app.add_middleware(
 )
 
 JOBS: dict[str, dict[str, Any]] = {}
+DELETED_JOB_IDS: set[str] = set()
 LOCK = threading.Lock()
 VOICE_QUEUE: queue.Queue[tuple[Any, ...]] = queue.Queue()
 MODEL_QUEUE: queue.Queue[tuple[Any, ...]] = queue.Queue()
@@ -241,8 +488,12 @@ RENDER_THREADS: set[threading.Thread] = set()
 RENDER_THREADS_LOCK = threading.Lock()
 RUNNING_PROCESSES: dict[str, subprocess.Popen[str]] = {}
 RUNNING_PROCESSES_LOCK = threading.Lock()
+STYLE_LIBRARY_LOCK = threading.Lock()
 MODEL_CONCURRENCY = 4
 MAX_ACTIVE_AND_QUEUED = 20
+VOICE_AUDIO_SUFFIXES = {".wav", ".mp3", ".m4a", ".aac", ".flac", ".ogg", ".webm"}
+VOICE_ID_PATTERN = re.compile(r"^[a-f0-9]{12}$")
+VOICE_LIBRARY_LOCK = threading.Lock()
 
 
 class JobCancelled(RuntimeError):
@@ -251,7 +502,7 @@ class JobCancelled(RuntimeError):
 
 def is_job_cancelled(job_id: str) -> bool:
     with LOCK:
-        return JOBS.get(job_id, {}).get("status") == "cancelled"
+        return job_id in DELETED_JOB_IDS or JOBS.get(job_id, {}).get("status") == "cancelled"
 
 
 def ensure_job_active(job_id: str) -> None:
@@ -353,7 +604,7 @@ def fit_scene_durations(scenes: list[dict[str, Any]], audio_duration: float) -> 
 def load_config() -> dict[str, Any]:
     STATE_DIR.mkdir(exist_ok=True)
     if not CONFIG_PATH.exists():
-        return DEFAULT_CONFIG.copy()
+        return normalize_tts_config(DEFAULT_CONFIG.copy())
     data = DEFAULT_CONFIG.copy()
     stored = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
     # Do not migrate the former Volcengine credential into OpenLux. A key must
@@ -365,7 +616,11 @@ def load_config() -> dict[str, Any]:
         data["text_model"] = DEFAULT_CONFIG["text_model"]
     if str(data.get("image_model", "")).startswith("doubao-"):
         data["image_model"] = DEFAULT_CONFIG["image_model"]
-    return data
+    try:
+        data["output_dir"] = normalize_output_dir(data.get("output_dir", ""))
+    except (ValueError, OSError):
+        data["output_dir"] = ""
+    return normalize_tts_config(data)
 
 
 def safe_config(data: dict[str, Any]) -> dict[str, Any]:
@@ -376,6 +631,208 @@ def safe_config(data: dict[str, Any]) -> dict[str, Any]:
     result["has_api_key"] = bool(data.get("api_key"))
     result["has_image_api_key"] = bool(data.get("image_api_key"))
     return result
+
+
+def normalize_tts_config(data: dict[str, Any]) -> dict[str, Any]:
+    result = data.copy()
+
+    def number(key: str, fallback: float, minimum: float, maximum: float) -> float:
+        try:
+            value = float(result.get(key, fallback))
+        except (TypeError, ValueError):
+            value = fallback
+        return max(minimum, min(maximum, value))
+
+    try:
+        mode = int(result.get("tts_emotion_mode", 0))
+    except (TypeError, ValueError):
+        mode = 0
+    result["tts_emotion_mode"] = max(0, min(3, mode))
+    result["tts_emotion_weight"] = number("tts_emotion_weight", 0.65, 0.0, 1.0)
+    raw_vectors = result.get("tts_emotion_vectors", [])
+    vectors = raw_vectors if isinstance(raw_vectors, list) else []
+    result["tts_emotion_vectors"] = [number_from_value(v, 0.0, -1.0, 1.0) for v in (vectors + [0.0] * 8)[:8]]
+    result["tts_emotion_text"] = str(result.get("tts_emotion_text", "") or "").strip()[:120]
+    def boolean(key: str, fallback: bool) -> bool:
+        value = result.get(key, fallback)
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            normalized = value.strip().lower()
+            if normalized in {"true", "1", "yes", "on"}:
+                return True
+            if normalized in {"false", "0", "no", "off", ""}:
+                return False
+        return bool(value) if value is not None else fallback
+
+    result["tts_emotion_random"] = boolean("tts_emotion_random", False)
+    result["tts_do_sample"] = boolean("tts_do_sample", True)
+    result["tts_top_p"] = number("tts_top_p", 0.8, 0.0, 1.0)
+    try:
+        result["tts_top_k"] = max(0, min(1000, int(result.get("tts_top_k", 30))))
+    except (TypeError, ValueError):
+        result["tts_top_k"] = 30
+    result["tts_temperature"] = number("tts_temperature", 0.8, 0.0, 2.0)
+    result["tts_length_penalty"] = number("tts_length_penalty", 0.0, -2.0, 2.0)
+    try:
+        result["tts_num_beams"] = max(1, min(20, int(result.get("tts_num_beams", 3))))
+    except (TypeError, ValueError):
+        result["tts_num_beams"] = 3
+    result["tts_repetition_penalty"] = number("tts_repetition_penalty", 10.0, 0.0, 20.0)
+    try:
+        result["tts_max_mel_tokens"] = max(100, min(10000, int(result.get("tts_max_mel_tokens", 1500))))
+    except (TypeError, ValueError):
+        result["tts_max_mel_tokens"] = 1500
+    try:
+        result["tts_max_text_tokens_per_segment"] = max(20, min(500, int(result.get("tts_max_text_tokens_per_segment", 120))))
+    except (TypeError, ValueError):
+        result["tts_max_text_tokens_per_segment"] = 120
+    return result
+
+
+def number_from_value(value: Any, fallback: float, minimum: float, maximum: float) -> float:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        number = fallback
+    return max(minimum, min(maximum, number))
+
+
+def normalize_output_dir(value: Any, *, create: bool = False) -> str:
+    raw = os.path.expandvars(os.path.expanduser(str(value or "").strip()))
+    if not raw:
+        return ""
+    path = Path(raw)
+    if not path.is_absolute():
+        raise ValueError("视频输出目录必须使用绝对路径")
+    path = path.resolve()
+    jobs_root = JOBS_DIR.resolve()
+    if path == jobs_root or jobs_root in path.parents:
+        raise ValueError("视频输出目录不能放在任务历史目录内")
+    if path.exists() and not path.is_dir():
+        raise ValueError("视频输出目录已存在但不是文件夹")
+    if create:
+        path.mkdir(parents=True, exist_ok=True)
+    return str(path)
+
+
+def normalize_aspect_ratio(value: Any) -> str:
+    candidate = str(value or "").strip()
+    return candidate if candidate in ASPECT_RATIO_SPECS else DEFAULT_ASPECT_RATIO
+
+
+def aspect_ratio_label(value: Any) -> str:
+    return normalize_aspect_ratio(value)
+
+
+def fit_image_to_aspect(image_path: Path, aspect_ratio: Any) -> None:
+    from PIL import Image
+
+    ratio = normalize_aspect_ratio(aspect_ratio)
+    target_width, target_height = ASPECT_RATIO_SPECS[ratio]["canvas_size"]
+    with Image.open(image_path) as source:
+        source = source.convert("RGB")
+        source_width, source_height = source.size
+        target = target_width / target_height
+        source_ratio = source_width / source_height
+        if source_ratio > target:
+            crop_width = max(1, round(source_height * target))
+            left = max(0, (source_width - crop_width) // 2)
+            source = source.crop((left, 0, left + crop_width, source_height))
+        elif source_ratio < target:
+            crop_height = max(1, round(source_width / target))
+            top = max(0, (source_height - crop_height) // 2)
+            source = source.crop((0, top, source_width, top + crop_height))
+        if source.size != (target_width, target_height):
+            source = source.resize((target_width, target_height), Image.Resampling.LANCZOS)
+        temporary = image_path.with_suffix(image_path.suffix + ".aspect.tmp")
+        source.save(temporary, format="PNG")
+    temporary.replace(image_path)
+
+
+def export_final_video(job_id: str, source: Path) -> str | None:
+    output_dir = normalize_output_dir(load_config().get("output_dir", ""), create=True)
+    if not output_dir:
+        return None
+    target = Path(output_dir) / f"whiteboard-{job_id}.mp4"
+    temporary = target.with_name(f".{target.name}.tmp")
+    try:
+        shutil.copy2(source, temporary)
+        temporary.replace(target)
+    finally:
+        temporary.unlink(missing_ok=True)
+    return str(target)
+
+
+def recorded_output_path(item: dict[str, Any], job_id: str) -> Path | None:
+    raw = str(item.get("output_path") or "")
+    if not raw:
+        return None
+    path = Path(raw).expanduser()
+    if not path.is_absolute() or path.name != f"whiteboard-{job_id}.mp4":
+        return None
+    return path
+
+
+def normalized_voice_name(value: Any, fallback: str = "") -> str:
+    name = re.sub(r"\s+", " ", str(value or "")).strip()
+    if not name:
+        name = re.sub(r"[_-]+", " ", Path(fallback).stem).strip()
+    return name[:30] or "未命名音色"
+
+
+def voice_metadata_path(voice_id: str) -> Path:
+    return VOICES_DIR / voice_id / "voice.json"
+
+
+def voice_snapshot(metadata: dict[str, Any], audio_path: Path) -> dict[str, Any]:
+    return {
+        "id": str(metadata.get("id") or audio_path.parent.name),
+        "name": normalized_voice_name(metadata.get("name"), audio_path.name),
+        "filename": audio_path.name,
+        "content_type": mimetypes.guess_type(audio_path.name)[0] or "audio/wav",
+        "size": audio_path.stat().st_size,
+        "created_at": float(metadata.get("created_at", 0)),
+    }
+
+
+def list_voice_snapshots() -> list[dict[str, Any]]:
+    VOICES_DIR.mkdir(parents=True, exist_ok=True)
+    items: list[dict[str, Any]] = []
+    with VOICE_LIBRARY_LOCK:
+        for metadata_path in VOICES_DIR.glob("*/voice.json"):
+            try:
+                metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+                voice_id = str(metadata.get("id") or metadata_path.parent.name)
+                if not VOICE_ID_PATTERN.fullmatch(voice_id):
+                    continue
+                filename = str(metadata.get("filename") or "")
+                if Path(filename).name != filename:
+                    continue
+                audio_path = metadata_path.parent / filename
+                if not audio_path.is_file():
+                    continue
+                items.append(voice_snapshot(metadata, audio_path))
+            except (OSError, json.JSONDecodeError, TypeError, ValueError):
+                continue
+    return sorted(items, key=lambda item: (float(item.get("created_at", 0)), str(item.get("id", ""))), reverse=True)
+
+
+def voice_record(voice_id: str) -> tuple[dict[str, Any], Path]:
+    if not VOICE_ID_PATTERN.fullmatch(voice_id):
+        raise HTTPException(404, "音色不存在")
+    metadata_path = voice_metadata_path(voice_id)
+    try:
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise HTTPException(404, "音色不存在") from exc
+    filename = str(metadata.get("filename") or "")
+    if Path(filename).name != filename or Path(filename).suffix.lower() not in VOICE_AUDIO_SUFFIXES:
+        raise HTTPException(404, "音色文件无效")
+    audio_path = metadata_path.parent / filename
+    if not audio_path.is_file():
+        raise HTTPException(404, "音色文件不存在")
+    return metadata, audio_path
 
 
 def configured_tts_nodes(config: dict[str, Any] | None = None) -> list[str]:
@@ -412,6 +869,8 @@ def request_client_ip(request: Request) -> str:
 
 def update_job(job_id: str, **values: Any) -> None:
     with LOCK:
+        if job_id not in JOBS:
+            return
         if JOBS[job_id].get("status") == "cancelled" and values.get("status") != "cancelled":
             return
         JOBS[job_id].update(values)
@@ -421,6 +880,8 @@ def update_job(job_id: str, **values: Any) -> None:
 def begin_phase(job_id: str, key: str, label: str, stage: str, progress: int) -> None:
     now = time.time()
     with LOCK:
+        if job_id not in JOBS:
+            raise JobCancelled("任务已删除")
         job = JOBS[job_id]
         if job.get("status") == "cancelled":
             raise JobCancelled("任务已取消")
@@ -442,6 +903,8 @@ def queue_for_stage(job_id: str, queue_stage: str, stage: str, progress: int) ->
     """Close the active timer and move a job to the next pipeline queue."""
     now = time.time()
     with LOCK:
+        if job_id not in JOBS:
+            raise JobCancelled("任务已删除")
         job = JOBS[job_id]
         if job.get("status") == "cancelled":
             raise JobCancelled("任务已取消")
@@ -461,6 +924,8 @@ def queue_for_stage(job_id: str, queue_stage: str, stage: str, progress: int) ->
 def finish_timing(job_id: str) -> None:
     now = time.time()
     with LOCK:
+        if job_id not in JOBS:
+            return
         job = JOBS[job_id]
         current = job.get("current_phase")
         started = job.get("phase_started_at")
@@ -791,6 +1256,59 @@ def split_script(copy: str, target_count: int) -> list[str]:
     return groups
 
 
+def _merge_scene_pair(first: dict[str, Any], second: dict[str, Any]) -> dict[str, Any]:
+    merged = dict(first)
+    first_title = str(first.get("title") or "").strip()
+    second_title = str(second.get("title") or "").strip()
+    if second_title and second_title != first_title:
+        merged["title"] = "；".join(value for value in (first_title, second_title) if value)[:40]
+
+    first_concept = str(first.get("concept") or "").strip()
+    second_concept = str(second.get("concept") or "").strip()
+    if second_concept and second_concept != first_concept:
+        merged["concept"] = "；".join(value for value in (first_concept, second_concept) if value)[:120]
+
+    elements: list[str] = []
+    for scene in (first, second):
+        raw_elements = scene.get("elements") or []
+        if not isinstance(raw_elements, list):
+            raw_elements = [raw_elements]
+        for element in raw_elements:
+            label = str(element.get("label") or "") if isinstance(element, dict) else str(element)
+            label = label.strip()
+            if label and label not in elements:
+                elements.append(label)
+    if elements:
+        merged["elements"] = elements[:4]
+
+    for field in ("visual_structure", "metaphor"):
+        if not merged.get(field) and second.get(field):
+            merged[field] = second[field]
+    return merged
+
+
+def normalize_standard_scene_count(candidate: list[dict[str, Any]], expected_count: int) -> list[dict[str, Any]]:
+    if len(candidate) <= expected_count:
+        return candidate
+    excess = len(candidate) - expected_count
+    allowed_excess = max(3, expected_count // 10)
+    if excess > allowed_excess:
+        raise RuntimeError(f"分镜模型返回 {len(candidate)} 幕，预期 {expected_count} 幕")
+
+    candidate_count = len(candidate)
+    normalized: list[dict[str, Any]] = []
+    for output_index in range(expected_count):
+        start = int(output_index * candidate_count / expected_count + 0.5)
+        end = int((output_index + 1) * candidate_count / expected_count + 0.5)
+        end = max(start + 1, end)
+        group = candidate[start:end]
+        merged = dict(group[0])
+        for scene in group[1:]:
+            merged = _merge_scene_pair(merged, scene)
+        normalized.append(merged)
+    return normalized
+
+
 def scene_limit_for_duration(duration: float) -> int:
     """Duration is a ceiling only: never exceed eight scenes per minute."""
     return max(1, int(max(0.0, duration) * 8 / 60))
@@ -1066,10 +1584,12 @@ elements 必须是恰好 3 个具体可画的中文短语，按叙事顺序排�
             candidate = parse_json_block(extract_response_text(payload))
             if not isinstance(candidate, list) or not candidate:
                 raise RuntimeError("分镜模型未返回有效场景")
-            if not infographic and len(candidate) != scene_count:
-                raise RuntimeError(f"分镜模型返回 {len(candidate)} 幕，预期 {scene_count} 幕")
             if not all(isinstance(scene, dict) for scene in candidate):
                 raise RuntimeError("分镜模型返回的数据结构无效")
+            if not infographic:
+                if len(candidate) < scene_count:
+                    raise RuntimeError(f"分镜模型返回 {len(candidate)} 幕，预期 {scene_count} 幕")
+                candidate = normalize_standard_scene_count(candidate, scene_count)
             if infographic:
                 if len(candidate) > requested_count:
                     raise RuntimeError(f"信息图页面超过上限 {requested_count}")
@@ -1106,7 +1626,7 @@ elements 必须是恰好 3 个具体可画的中文短语，按叙事顺序排�
     return scenes
 
 
-def build_image_prompt(scene: dict[str, Any], style: str) -> str:
+def build_image_prompt(scene: dict[str, Any], style: str, aspect_ratio: str = DEFAULT_ASPECT_RATIO) -> str:
     labels = scene.get("elements") or [scene.get("title", "场景主体")]
     count = len(labels)
     lanes = "；".join(f"第{i + 1}区：{label}" for i, label in enumerate(labels))
@@ -1115,7 +1635,7 @@ def build_image_prompt(scene: dict[str, Any], style: str) -> str:
         if style == OIL_VISUAL_STYLE else
         "同一主角固定为：中国青年男性，短黑发，朴素深色上衣，普通人形象；不要改变年龄与外貌。"
     )
-    return f"""生成一张用于中文口播的 16:9 白板动画分镜原画。
+    return f"""生成一张用于中文口播的 {aspect_ratio_label(aspect_ratio)} 白板动画分镜原画。
 风格名称：{style}。
 视觉配方：{style_recipe(style)}
 必须严格执行这套视觉配方，不得自动改回其他白板风格；人物、物体和配色都要让所选风格一眼可辨。
@@ -1130,12 +1650,13 @@ def build_image_prompt(scene: dict[str, Any], style: str) -> str:
 禁止任何文字、字母、数字、Logo、水印、边框、对话框和装饰性填充。画面底部保留约 16% 空白作为字幕安全区。"""
 
 
-def build_board_prompt(scenes: list[dict[str, Any]], style: str, reference_instruction: str = "", use_character_references: bool = False, infographic: bool = False) -> str:
+def build_board_prompt(scenes: list[dict[str, Any]], style: str, reference_instruction: str = "", use_character_references: bool = False, infographic: bool = False, aspect_ratio: str = DEFAULT_ASPECT_RATIO) -> str:
+    aspect_ratio = aspect_ratio_label(aspect_ratio)
     if infographic:
         scene = scenes[0]
         elements = "、".join(scene.get("illustration_elements") or scene.get("nodes") or [])
         reference_block = f"视觉参考使用规则：{reference_instruction}\n" if reference_instruction else ""
-        return f"""生成一张 16:9 中文知识解说视频的独立插画素材。
+        return f"""生成一张 {aspect_ratio} 中文知识解说视频的独立插画素材。
 所选画面风格：{style}。视觉配方：{style_recipe(style)}
 {reference_block}必须让画面在 3 秒内认出主体、10 秒内看懂观点证据；不是装饰性配图。
 画面只画以下具象内容：{elements}。对应观点：{scene.get('concept', '')}。
@@ -1170,7 +1691,7 @@ PPT 已确定的视觉策略：{scene.get('visual_strategy', '左侧文字，右
         "同一主角固定为：中国青年男性，短黑发，朴素深色上衣，普通人形象；所有分镜中的年龄与外貌保持一致。"
     )
     reference_block = f"参考图说明：\n{reference_instruction}\n" if reference_instruction else ""
-    return f"""{reference_block}生成一张用于中文口播的 16:9 白板动画原画，一张图承载 {len(scenes)} 个连续分镜。
+    return f"""{reference_block}生成一张用于中文口播的 {aspect_ratio} 白板动画原画，一张图承载 {len(scenes)} 个连续分镜。
 风格名称：{style}。
 {style_instruction}
 {character_instruction}
@@ -1181,16 +1702,17 @@ PPT 已确定的视觉策略：{scene.get('visual_strategy', '左侧文字，右
 禁止任何文字、字母、数字、Logo、水印、边框和对话框。画面底部保留约 16% 空白作为字幕安全区。"""
 
 
-def generate_image(config: dict[str, Any], prompt: str, target: Path, reference_images: list[Path] | None = None, job_id: str | None = None) -> None:
+def generate_image(config: dict[str, Any], prompt: str, target: Path, reference_images: list[Path] | None = None, job_id: str | None = None, aspect_ratio: str = DEFAULT_ASPECT_RATIO, quality: str = "medium") -> None:
     # OpenLux documents a 1000-character limit for this GPT Image route.
     config = image_provider_config(config)
     compact_prompt = prompt if len(prompt) <= 1000 else f"{prompt[:830]}\n{prompt[-160:]}"
+    aspect_ratio = aspect_ratio_label(aspect_ratio)
     request_payload = {
         "model": config["image_model"],
         "prompt": compact_prompt,
         "n": 1,
-        "size": "1536x1024",
-        "quality": "medium",
+        "size": ASPECT_RATIO_SPECS[aspect_ratio]["image_size"],
+        "quality": quality if quality in {"low", "medium", "high", "xhigh", "max"} else "medium",
         "format": "png",
     }
     if reference_images:
@@ -1291,12 +1813,104 @@ def custom_reference_context(job_id: str) -> tuple[list[Path], str, str]:
     return paths, "\n".join(lines), "；".join(character_descriptions)
 
 
+TTS_PROTECTED_TOKEN_PATTERN = re.compile(
+    r"(?<![A-Za-z0-9])(?:\d{4}-\d{1,2}-\d{1,2}|[A-Za-z][A-Za-z0-9]*(?:[.-][A-Za-z0-9]+)+)(?![A-Za-z0-9])"
+)
+TTS_RANGE_PATTERN = re.compile(
+    r"(?<![A-Za-z0-9])(?P<left>\d+(?:\.\d+)?)\s*-\s*(?P<right>\d+(?:\.\d+)?)(?![A-Za-z0-9])"
+)
+TTS_NEGATIVE_PATTERN = re.compile(r"(?<![A-Za-z0-9负])-(?=\d+(?:\.\d+)?)")
+TTS_HYPHEN_PATTERN = re.compile(r"[-‐‑‒–—]")
+
+
+def load_pronunciation_rules() -> list[tuple[str, str, str]]:
+    if not PRONUNCIATION_PATH.exists():
+        return []
+    try:
+        payload = yaml.safe_load(PRONUNCIATION_PATH.read_text(encoding="utf-8"))
+    except (OSError, yaml.YAMLError) as exc:
+        raise RuntimeError(f"读取 pronunciation.yaml 失败：{exc}") from exc
+    if payload is None:
+        return []
+    entries: Any = payload.get("phrases", []) if isinstance(payload, dict) else payload
+    if isinstance(entries, dict):
+        normalized_entries: list[dict[str, Any]] = []
+        for phrase, value in entries.items():
+            if isinstance(value, dict):
+                normalized_entries.append({"phrase": phrase, **value})
+            else:
+                normalized_entries.append({"phrase": phrase, "pinyin": value})
+        entries = normalized_entries
+    if not isinstance(entries, list):
+        raise RuntimeError("pronunciation.yaml 的 phrases 必须是列表")
+    rules: list[tuple[str, str, str]] = []
+    for index, entry in enumerate(entries, 1):
+        if not isinstance(entry, dict):
+            raise RuntimeError(f"pronunciation.yaml 第 {index} 条规则格式无效")
+        phrase = str(entry.get("phrase") or entry.get("text") or "").strip()
+        character = str(entry.get("char") or entry.get("character") or "").strip()
+        pinyin = str(entry.get("pinyin") or entry.get("pronunciation") or "").strip().upper()
+        if not phrase or len(character) != 1 or phrase.count(character) != 1:
+            raise RuntimeError(f"pronunciation.yaml 第 {index} 条规则必须指定唯一的 char")
+        if not re.fullmatch(r"[A-ZÜ]+[1-5]", pinyin):
+            raise RuntimeError(f"pronunciation.yaml 第 {index} 条规则的 pinyin 无效：{pinyin}")
+        rules.append((phrase, character, pinyin))
+    return sorted(set(rules), key=lambda item: len(item[0]), reverse=True)
+
+
+def preprocess_tts_text(text: str) -> str:
+    source = str(text or "")
+    if not source:
+        return source
+    protected: dict[str, str] = {}
+
+    def protect_token(match: re.Match[str]) -> str:
+        token = match.group(0)
+        if "-" not in token and not re.fullmatch(r"\d{4}-\d{1,2}-\d{1,2}", token):
+            return token
+        if not re.search(r"\d", token) and not re.search(r"[A-Z]{2,}", token):
+            return token
+        marker = f"\ue000{len(protected)}\ue001"
+        protected[marker] = token
+        return marker
+
+    result = TTS_PROTECTED_TOKEN_PATTERN.sub(protect_token, source)
+    for phrase, character, pinyin in load_pronunciation_rules():
+        result = result.replace(phrase, phrase.replace(character, f"<{character}|{pinyin}>"))
+    result = TTS_RANGE_PATTERN.sub(r"\g<left>到\g<right>", result)
+    result = TTS_NEGATIVE_PATTERN.sub("负", result)
+    result = TTS_HYPHEN_PATTERN.sub("，", result)
+    for marker, token in protected.items():
+        result = result.replace(marker, token)
+    return result
+
+
 def _synthesize_voice_once(config: dict[str, Any], reference: Path, copy: str, target: Path) -> None:
-    if config.get("tts_mode") == "fastapi":
+    tts_config = normalize_tts_config(config)
+    if tts_config.get("tts_mode") == "fastapi":
         with httpx.Client(timeout=900) as client, reference.open("rb") as audio:
             response = client.post(
-                f"{config['tts_url'].rstrip('/')}/api/tts",
-                data={"text": copy, "emo_weight": "0.65"},
+                f"{tts_config['tts_url'].rstrip('/')}/api/tts",
+                data={
+                    "text": copy,
+                    "emo_control_method": str(tts_config["tts_emotion_mode"]),
+                    "emo_weight": str(tts_config["tts_emotion_weight"]),
+                    **{
+                        f"vec{index}": str(value)
+                        for index, value in enumerate(tts_config["tts_emotion_vectors"], 1)
+                    },
+                    "emo_text": tts_config["tts_emotion_text"],
+                    "emo_random": str(tts_config["tts_emotion_random"]).lower(),
+                    "do_sample": str(tts_config["tts_do_sample"]).lower(),
+                    "top_p": str(tts_config["tts_top_p"]),
+                    "top_k": str(tts_config["tts_top_k"]),
+                    "temperature": str(tts_config["tts_temperature"]),
+                    "length_penalty": str(tts_config["tts_length_penalty"]),
+                    "num_beams": str(tts_config["tts_num_beams"]),
+                    "repetition_penalty": str(tts_config["tts_repetition_penalty"]),
+                    "max_mel_tokens": str(tts_config["tts_max_mel_tokens"]),
+                    "max_text_tokens_per_segment": str(tts_config["tts_max_text_tokens_per_segment"]),
+                },
                 files={"voice": (reference.name, audio, "audio/wav")},
             )
             if response.is_error:
@@ -1306,11 +1920,37 @@ def _synthesize_voice_once(config: dict[str, Any], reference: Path, copy: str, t
 
     # Long-form cloning can keep the GPU busy for several minutes.  The
     # default Gradio HTTP read timeout is too short and abandons a healthy job.
-    client = Client(config["tts_url"], verbose=False, httpx_kwargs={"timeout": 1800.0})
+    client = Client(tts_config["tts_url"], verbose=False, httpx_kwargs={"timeout": 1800.0})
+    emotion_control_method = "与音色参考音频相同"
+    try:
+        api_info = client.view_api(return_format="dict", print_info=False)
+        endpoint = api_info.get("named_endpoints", {}).get("/gen_single", {})
+        parameter = (endpoint.get("parameters") or [])[0]
+        choices = parameter.get("type", {}).get("enum") or []
+        candidates = [
+            choices[tts_config["tts_emotion_mode"]]
+            if tts_config["tts_emotion_mode"] < len(choices)
+            else None,
+            parameter.get("parameter_default"),
+            parameter.get("example_input"),
+            choices[0] if choices else None,
+            "与音色参考音频相同",
+            "Same as the voice reference",
+        ]
+        emotion_control_method = next(
+            value for value in candidates if isinstance(value, str) and value
+        )
+    except (AttributeError, IndexError, KeyError, StopIteration, TypeError, ValueError):
+        pass
     job = client.submit(
-        "Same as the voice reference", handle_file(str(reference)), copy, "ZH", None, 0.65,
-        0, 0, 0, 0, 0, 0, 0, 0, "", False, 120, 1.0,
-        True, 0.8, 30, 0.8, 0.0, 3, 10.0, 1500,
+        emotion_control_method, handle_file(str(reference)), copy, "ZH", None,
+        tts_config["tts_emotion_weight"], *tts_config["tts_emotion_vectors"],
+        tts_config["tts_emotion_text"], tts_config["tts_emotion_random"],
+        tts_config["tts_max_text_tokens_per_segment"], 1.0,
+        tts_config["tts_do_sample"], tts_config["tts_top_p"],
+        tts_config["tts_top_k"], tts_config["tts_temperature"],
+        tts_config["tts_length_penalty"], tts_config["tts_num_beams"],
+        tts_config["tts_repetition_penalty"], tts_config["tts_max_mel_tokens"],
         api_name="/gen_single",
     )
     result = job.result(timeout=1800)
@@ -1347,10 +1987,11 @@ def _synthesize_voice_once(config: dict[str, Any], reference: Path, copy: str, t
 
 def synthesize_voice(config: dict[str, Any], reference: Path, copy: str, target: Path) -> None:
     """Retry transient LAN failures while keeping TTS concurrency at one."""
+    tts_copy = preprocess_tts_text(copy)
     last_error: Exception | None = None
     for attempt in range(4):
         try:
-            _synthesize_voice_once(config, reference, copy, target)
+            _synthesize_voice_once(config, reference, tts_copy, target)
             return
         except Exception as exc:
             last_error = exc
@@ -1651,7 +2292,15 @@ def _subtitle_video_input(video: Path, subtitles: Path, fallback_target: Path, j
     return fallback_target, None
 
 
-def remotion_infographic_props(scenes: list[dict[str, Any]], style: str, duration_ms: int, subtitles_enabled: bool = False) -> dict[str, Any]:
+def remotion_infographic_props(
+    scenes: list[dict[str, Any]],
+    style: str,
+    duration_ms: int,
+    subtitles_enabled: bool = False,
+    aspect_ratio: str = DEFAULT_ASPECT_RATIO,
+) -> dict[str, Any]:
+    aspect_ratio = normalize_aspect_ratio(aspect_ratio)
+    width, height = ASPECT_RATIO_SPECS[aspect_ratio]["canvas_size"]
     pages: list[dict[str, Any]] = []
     for index, scene in enumerate(scenes, 1):
         timed_cues = scene.get("timed_cues")
@@ -1692,8 +2341,8 @@ def remotion_infographic_props(scenes: list[dict[str, Any]], style: str, duratio
         })
     return {
         "fps": 30,
-        "width": 1920,
-        "height": 1080,
+        "width": width,
+        "height": height,
         "totalDurationMs": duration_ms,
         "totalDurationFrames": max(1, math.ceil(duration_ms * 30 / 1000)),
         "style": style,
@@ -1738,6 +2387,7 @@ def model_stage(job_id: str, copy: str, style: str, reference: Path, scenes_per_
     job_dir = JOBS_DIR / job_id
     try:
         config = load_config()
+        aspect_ratio = normalize_aspect_ratio(JOBS.get(job_id, {}).get("aspect_ratio"))
         voice = job_dir / "voice.wav"
         duration = probe_duration(voice)
         reference_images, reference_instruction, character_context = custom_reference_context(job_id)
@@ -1805,7 +2455,7 @@ def model_stage(job_id: str, copy: str, style: str, reference: Path, scenes_per_
             )
             atomic_write_json(plan_path, scenes)
             atomic_write_json(job_dir / "alignment-report.json", alignment_report)
-            deck_spec = remotion_infographic_props(scenes, style, round(duration * 1000), include_subtitles)
+            deck_spec = remotion_infographic_props(scenes, style, round(duration * 1000), include_subtitles, aspect_ratio)
             atomic_write_json(job_dir / "deck-spec.json", deck_spec)
             atomic_write_json(job_dir / "content-timeline.json", {
                 "schema_version": 1,
@@ -1838,7 +2488,7 @@ def model_stage(job_id: str, copy: str, style: str, reference: Path, scenes_per_
             elif style == OIL_VISUAL_STYLE and not board_images:
                 board_images, board_instruction = oil_visual_reference_context(board, infographic)
                 use_character_references = False
-            board_prompt = build_board_prompt(board, style, board_instruction, use_character_references, infographic)
+            board_prompt = build_board_prompt(board, style, board_instruction, use_character_references, infographic, aspect_ratio)
             board_specs.append((board_images, board_instruction, board_prompt))
         update_job(job_id, duration=duration, scenes=len(scenes), boards=len(boards), checkpoint="plan_done")
         atomic_write_json(job_dir / "boards.json", [
@@ -1859,9 +2509,10 @@ def model_stage(job_id: str, copy: str, style: str, reference: Path, scenes_per_
                 for attempt in range(3):
                     partial_image.unlink(missing_ok=True)
                     try:
-                        generate_image(config, board_prompt, partial_image, board_images, job_id)
+                        generate_image(config, board_prompt, partial_image, board_images, job_id, aspect_ratio)
                         ensure_job_active(job_id)
                         if valid_image_file(partial_image):
+                            fit_image_to_aspect(partial_image, aspect_ratio)
                             break
                         raise RuntimeError("模型返回的图片文件无效")
                     except JobCancelled:
@@ -1877,10 +2528,13 @@ def model_stage(job_id: str, copy: str, style: str, reference: Path, scenes_per_
                 if not valid_image_file(partial_image):
                     raise RuntimeError(f"第 {i} 张分镜图连续 3 次生成无效：{last_image_error}")
                 partial_image.replace(source_image)
+            elif valid_image_file(source_image):
+                fit_image_to_aspect(source_image, aspect_ratio)
             if include_key_text and not infographic:
                 add_key_text(source_image, [str(scene.get("key_text", "")) for scene in board], image)
             else:
                 shutil.copy2(source_image, image)
+            fit_image_to_aspect(image, aspect_ratio)
             update_job(job_id, checkpoint="images", completed_boards=i)
         queue_for_stage(job_id, "render", "准备本地渲染", 78)
         start_render_task(render_generated_job, job_id, scenes, boards, pen_text, include_subtitles, stroke_detail, duration)
@@ -1899,6 +2553,7 @@ def render_generated_job(job_id: str, scenes: list[dict[str, Any]], boards: list
     job_dir = JOBS_DIR / job_id
     try:
         infographic = is_infographic_job(job_id)
+        aspect_ratio = normalize_aspect_ratio(JOBS.get(job_id, {}).get("aspect_ratio"))
         duration_ms = round(duration * 1000)
         if infographic:
             begin_phase(job_id, "drawing", "Remotion 渲染", "正在按真实旁白时间编排动态信息图", 80)
@@ -1915,6 +2570,7 @@ def render_generated_job(job_id: str, scenes: list[dict[str, Any]], boards: list
                         str(JOBS.get(job_id, {}).get("style") or DEFAULT_STYLE),
                         duration_ms,
                         include_subtitles,
+                        aspect_ratio,
                     ),
                 )
                 run([
@@ -1938,13 +2594,15 @@ def render_generated_job(job_id: str, scenes: list[dict[str, Any]], boards: list
                 image = job_dir / f"{stem}.png"
                 annotation = job_dir / f"{stem}.annotation.json"
                 video = job_dir / f"{stem}.mp4"
+                if valid_image_file(image):
+                    fit_image_to_aspect(image, aspect_ratio)
                 expected_ms = sum(int(scene["duration_ms"]) for scene in board)
                 if not valid_timed_video(video, expected_ms):
                     video.unlink(missing_ok=True)
                     partial_video = job_dir / f"{stem}.partial.mp4"
                     partial_video.unlink(missing_ok=True)
                     write_board_annotation(board, image, annotation, i)
-                    run([str(PYTHON), str(ROOT / "scripts" / "render_stream_whiteboard.py"), str(image), str(annotation), str(partial_video), str(hand_asset), "--ink-path", "skeleton", "--stroke-detail", stroke_detail, "--color-fill", "contour-wipe"], job_id=job_id)
+                    run([str(PYTHON), str(ROOT / "scripts" / "render_stream_whiteboard.py"), str(image), str(annotation), str(partial_video), str(hand_asset), "--ink-path", "skeleton", "--stroke-detail", stroke_detail, "--color-fill", "paint", "--keep-raw"], job_id=job_id)
                     if not valid_media_file(partial_video):
                         raise RuntimeError(f"第 {i} 段手绘视频无效")
                     partial_video.replace(video)
@@ -1979,13 +2637,14 @@ def render_generated_job(job_id: str, scenes: list[dict[str, Any]], boards: list
             ffmpeg_command = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-i", video_input.name, "-i", "voice.wav", "-map", "0:v:0", "-map", "1:a:0"]
             if subtitle_filter:
                 ffmpeg_command.extend(["-vf", subtitle_filter])
-            ffmpeg_command.extend(["-c:v", "libx264", "-preset", "medium", "-crf", "19", "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "160k", "-movflags", "+faststart", "-shortest", partial_final.name])
+            ffmpeg_command.extend(["-c:v", "libx264", "-preset", "fast", "-crf", "19", "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "160k", "-movflags", "+faststart", "-shortest", partial_final.name])
             run(ffmpeg_command, cwd=job_dir, job_id=job_id)
             if not valid_media_file(partial_final):
                 raise RuntimeError("最终音画文件无效")
             partial_final.replace(final)
+        output_path = export_final_video(job_id, final)
         finish_timing(job_id)
-        update_job(job_id, status="done", stage="制作完成", progress=100, result_url=f"/api/jobs/{job_id}/download", result_file=final.name, duration=duration, scenes=len(scenes), boards=len(boards), can_rerender=True)
+        update_job(job_id, status="done", stage="制作完成", progress=100, result_url=f"/api/jobs/{job_id}/download", result_file=final.name, output_path=output_path, duration=duration, scenes=len(scenes), boards=len(boards), can_rerender=True)
     except Exception as exc:
         fail_job(job_id, "本地渲染失败", exc)
 
@@ -1993,6 +2652,7 @@ def render_generated_job(job_id: str, scenes: list[dict[str, Any]], boards: list
 def rerender_job(job_id: str, scenes_per_image: int, pen_text: str, include_key_text: bool, include_subtitles: bool, stroke_detail: str) -> None:
     job_dir = JOBS_DIR / job_id
     try:
+        aspect_ratio = normalize_aspect_ratio(JOBS.get(job_id, {}).get("aspect_ratio"))
         scenes = json.loads((job_dir / "plan.json").read_text(encoding="utf-8"))
         voice = job_dir / "voice.wav"
         duration = probe_duration(voice)
@@ -2011,19 +2671,21 @@ def rerender_job(job_id: str, scenes_per_image: int, pen_text: str, include_key_
             annotation = job_dir / f"{stem}.annotation.json"
             video = job_dir / f"{stem}.mp4"
             if source_image.exists():
+                fit_image_to_aspect(source_image, aspect_ratio)
                 if include_key_text:
                     add_key_text(source_image, [str(scene.get("key_text", "")) for scene in board], image)
                 else:
                     shutil.copy2(source_image, image)
             if not image.exists():
                 raise RuntimeError(f"缺少可复用的分镜图：{image.name}")
+            fit_image_to_aspect(image, aspect_ratio)
             write_board_annotation(board, image, annotation, i)
             expected_ms = sum(int(scene["duration_ms"]) for scene in board)
             if not valid_timed_video(video, expected_ms):
                 video.unlink(missing_ok=True)
                 partial_video = job_dir / f"{stem}.partial.mp4"
                 partial_video.unlink(missing_ok=True)
-                run([str(PYTHON), str(ROOT / "scripts" / "render_stream_whiteboard.py"), str(image), str(annotation), str(partial_video), str(hand_asset), "--ink-path", "skeleton", "--stroke-detail", stroke_detail, "--color-fill", "contour-wipe"], job_id=job_id)
+                run([str(PYTHON), str(ROOT / "scripts" / "render_stream_whiteboard.py"), str(image), str(annotation), str(partial_video), str(hand_asset), "--ink-path", "skeleton", "--stroke-detail", stroke_detail, "--color-fill", "paint", "--keep-raw"], job_id=job_id)
                 if not valid_media_file(partial_video):
                     raise RuntimeError(f"第 {i} 段重新渲染视频无效")
                 partial_video.replace(video)
@@ -2057,13 +2719,14 @@ def rerender_job(job_id: str, scenes_per_image: int, pen_text: str, include_key_
             ffmpeg_command = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-i", video_input.name, "-i", "voice.wav", "-map", "0:v:0", "-map", "1:a:0"]
             if subtitle_filter:
                 ffmpeg_command.extend(["-vf", subtitle_filter])
-            ffmpeg_command.extend(["-c:v", "libx264", "-preset", "medium", "-crf", "19", "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "160k", "-movflags", "+faststart", "-shortest", partial_final.name])
+            ffmpeg_command.extend(["-c:v", "libx264", "-preset", "fast", "-crf", "19", "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "160k", "-movflags", "+faststart", "-shortest", partial_final.name])
             run(ffmpeg_command, cwd=job_dir, job_id=job_id)
             if not valid_media_file(partial_final):
                 raise RuntimeError("重新渲染的最终音画文件无效")
             partial_final.replace(final)
+        output_path = export_final_video(job_id, final)
         finish_timing(job_id)
-        update_job(job_id, status="done", stage="重新渲染完成", progress=100, result_url=f"/api/jobs/{job_id}/download", duration=duration, scenes=len(scenes), boards=len(boards), can_rerender=True)
+        update_job(job_id, status="done", stage="重新渲染完成", progress=100, result_url=f"/api/jobs/{job_id}/download", result_file=final.name, output_path=output_path, duration=duration, scenes=len(scenes), boards=len(boards), can_rerender=True)
     except Exception as exc:
         fail_job(job_id, "重新渲染失败", exc)
 
@@ -2127,6 +2790,7 @@ def regenerate_board_image(job_id: str, page: int, prompt: str) -> None:
 
         begin_phase(job_id, "images", "单图重生成", f"正在按修改后的提示词重新生成第 {page} 张图片", 50)
         config = load_config()
+        aspect_ratio = normalize_aspect_ratio(selected.get("aspect_ratio", source.get("aspect_ratio")))
         board = boards[page - 1]
         reference_images, _reference_instruction, _character_context = custom_reference_context(source_id)
         style = str(source.get("style") or DEFAULT_STYLE)
@@ -2143,9 +2807,10 @@ def regenerate_board_image(job_id: str, page: int, prompt: str) -> None:
         for attempt in range(3):
             partial_image.unlink(missing_ok=True)
             try:
-                generate_image(config, prompt, partial_image, reference_images, job_id)
+                generate_image(config, prompt, partial_image, reference_images, job_id, aspect_ratio)
                 ensure_job_active(job_id)
                 if valid_image_file(partial_image):
+                    fit_image_to_aspect(partial_image, aspect_ratio)
                     break
                 raise RuntimeError("模型返回的图片文件无效")
             except JobCancelled:
@@ -2167,12 +2832,14 @@ def regenerate_board_image(job_id: str, page: int, prompt: str) -> None:
             if previous.exists():
                 shutil.copy2(previous, revision_dir / previous.name)
         partial_image.replace(source_image)
+        fit_image_to_aspect(source_image, aspect_ratio)
         include_key_text = bool(selected.get("include_key_text", source.get("include_key_text", True)))
         if include_key_text and not is_infographic_job(job_id):
             from scripts.add_key_text import add_key_text
             add_key_text(source_image, [str(scene.get("key_text", "")) for scene in board], image)
         else:
             shutil.copy2(source_image, image)
+        fit_image_to_aspect(image, aspect_ratio)
 
         try:
             manifest = json.loads(boards_path.read_text(encoding="utf-8")) if boards_path.exists() else []
@@ -2277,6 +2944,8 @@ def enqueue_job_from_checkpoint(job_id: str, item: dict[str, Any]) -> None:
     if result_name not in {"final.mp4", "final-remotion-v1.mp4"}:
         result_name = "final.mp4"
     if valid_media_file(job_dir / result_name):
+        recorded_path = recorded_output_path(item, job_id)
+        output_path = str(recorded_path) if recorded_path and recorded_path.is_file() else export_final_video(job_id, job_dir / result_name)
         finish_timing(job_id)
         update_job(
             job_id,
@@ -2285,6 +2954,7 @@ def enqueue_job_from_checkpoint(job_id: str, item: dict[str, Any]) -> None:
             progress=100,
             result_url=f"/api/jobs/{job_id}/download",
             result_file=result_name,
+            output_path=output_path,
             can_rerender=True,
         )
         return
@@ -2362,22 +3032,52 @@ def get_config() -> dict[str, Any]:
     return safe_config(load_config())
 
 
+@app.post("/api/config/select-output-directory")
+def select_output_directory() -> dict[str, Any]:
+    if sys.platform != "darwin":
+        raise HTTPException(400, "当前系统不支持原生文件夹选择，请手动填写绝对路径")
+    try:
+        result = subprocess.run(
+            ["osascript", "-e", 'POSIX path of (choose folder with prompt "选择视频输出目录")'],
+            capture_output=True,
+            text=True,
+            timeout=120,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise HTTPException(500, "无法打开 macOS 文件夹选择器") from exc
+    if result.returncode != 0:
+        if "User canceled" in result.stderr or "(-128)" in result.stderr:
+            return {"cancelled": True, "path": ""}
+        raise HTTPException(500, "macOS 文件夹选择器打开失败")
+    try:
+        path = normalize_output_dir(result.stdout, create=False)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    return {"cancelled": False, "path": path}
+
+
 @app.post("/api/config")
 def save_config(payload: dict[str, Any]) -> dict[str, Any]:
     current = load_config()
     masked_keys = ("api_key", "image_api_key")
-    clearable_keys = ("tts_url_2", "image_base_url", "image_api_key")
+    clearable_keys = ("tts_url_2", "image_base_url", "image_api_key", "output_dir")
     for key in DEFAULT_CONFIG:
         value = payload.get(key)
         if key in masked_keys and isinstance(value, str) and "••••" in value:
             continue
-        # Optional string fields must accept an empty value so the user can
-        # switch back to the shared provider without editing the JSON file.
         if key in clearable_keys and isinstance(value, str):
+            if key == "output_dir":
+                try:
+                    current[key] = normalize_output_dir(value, create=True)
+                except (ValueError, OSError) as exc:
+                    raise HTTPException(400, str(exc)) from exc
+                continue
             current[key] = value.strip()
             continue
         if value not in (None, ""):
             current[key] = value
+    current = normalize_tts_config(current)
     STATE_DIR.mkdir(exist_ok=True)
     CONFIG_PATH.write_text(json.dumps(current, ensure_ascii=False, indent=2), encoding="utf-8")
     ensure_pipeline_workers()
@@ -2423,6 +3123,51 @@ def test_config(payload: dict[str, Any]) -> dict[str, Any]:
     return results
 
 
+@app.post("/api/image-generate")
+def generate_standalone_image(payload: dict[str, Any]) -> dict[str, Any]:
+    prompt = str(payload.get("prompt") or "").strip()
+    style_name = str(payload.get("style_name") or "").strip()
+    style_recipe = str(payload.get("style_recipe") or "").strip()
+    aspect_ratio = normalize_aspect_ratio(payload.get("aspect_ratio"))
+    quality = str(payload.get("quality") or "medium").strip()
+    if not prompt:
+        raise HTTPException(400, "请先输入画面描述")
+    if len(prompt) > 4000:
+        raise HTTPException(400, "提示词最多 4000 个字符")
+    if len(style_recipe) > 3000:
+        raise HTTPException(400, "画风配方过长")
+    if quality not in {"medium", "high"}:
+        raise HTTPException(400, "图片质量选项不受支持")
+
+    config = load_config()
+    if not image_provider_config(config).get("api_key"):
+        raise HTTPException(400, "请先在 API 设置中填写图片 API Key 或 OpenLux API Key")
+    complete_prompt = (
+        f"{prompt}\n\nVisual style direction{f' ({style_name})' if style_name else ''}: {style_recipe}"
+        if style_recipe
+        else prompt
+    )
+    with tempfile.TemporaryDirectory(prefix="image-lab-", dir=str(STATE_DIR)) as directory:
+        target = Path(directory) / "generated.png"
+        try:
+            generate_image(config, complete_prompt, target, aspect_ratio=aspect_ratio, quality=quality)
+        except ProviderHTTPError as exc:
+            raise HTTPException(exc.status_code, str(exc)) from exc
+        except Exception as exc:
+            raise HTTPException(502, str(exc)) from exc
+        if not target.is_file():
+            raise HTTPException(502, "图片服务没有返回图像文件")
+        encoded = base64.b64encode(target.read_bytes()).decode("ascii")
+
+    return {
+        "image": f"data:image/png;base64,{encoded}",
+        "model": str(config.get("image_model") or "gpt-image-2"),
+        "style_name": style_name or None,
+        "aspect_ratio": aspect_ratio,
+        "quality": quality,
+    }
+
+
 @app.get("/api/preferences")
 def get_preferences() -> dict[str, Any]:
     if not PREFERENCES_PATH.exists():
@@ -2447,18 +3192,281 @@ def save_preferences(payload: dict[str, Any]) -> dict[str, Any]:
     return preferences
 
 
+def paginate_items(
+    items: list[dict[str, Any]],
+    *,
+    search: str = "",
+    page: int = 1,
+    page_size: int = 20,
+    fields: tuple[str, ...] = (),
+) -> dict[str, Any]:
+    needle = str(search or "").strip().casefold()
+    filtered = items
+    if needle:
+        filtered = [
+            item
+            for item in items
+            if needle in " ".join(
+                str(item.get(field, ""))
+                if not isinstance(item.get(field), list)
+                else " ".join(str(value) for value in item.get(field, []))
+                for field in fields
+            ).casefold()
+        ]
+    size = max(1, min(100, int(page_size or 20)))
+    total = len(filtered)
+    pages = max(1, math.ceil(total / size))
+    current_page = max(1, min(pages, int(page or 1)))
+    start = (current_page - 1) * size
+    return {
+        "items": filtered[start : start + size],
+        "search": str(search or ""),
+        "page": current_page,
+        "page_size": size,
+        "total": total,
+        "pages": pages,
+    }
+
+
+@app.get("/api/styles")
+def list_styles(search: str = "", page: int = 1, page_size: int = 20) -> dict[str, Any]:
+    with STYLE_LIBRARY_LOCK:
+        items = load_custom_styles()
+        visible = [item for item in all_style_records(items) if item.get("builtin") or not item.get("deleted")]
+        snapshots = [style_snapshot(item) for item in visible]
+        return paginate_items(
+            snapshots,
+            search=search,
+            page=page,
+            page_size=page_size,
+            fields=("id", "name", "aliases", "description", "recipe", "type"),
+        )
+
+
+@app.post("/api/styles")
+async def create_style(
+    name: str = Form(""),
+    description: str = Form(""),
+    recipe: str = Form(""),
+    image: UploadFile | None = File(None),
+) -> dict[str, Any]:
+    name = normalized_style_name(name)
+    description = normalized_style_description(description)
+    recipe = normalized_style_recipe(recipe)
+    if len(name) < 2:
+        raise HTTPException(400, "画面风格名称至少需要 2 个字")
+    if len(recipe) < 10:
+        raise HTTPException(400, "画面风格配方至少需要 10 个字")
+    with STYLE_LIBRARY_LOCK:
+        items = load_custom_styles()
+        if style_name_conflicts(name, items):
+            raise HTTPException(409, "画面风格名称已经存在")
+        style_id = uuid.uuid4().hex[:12]
+        style_dir = STYLES_DIR / style_id
+        style_dir.mkdir(parents=True, exist_ok=False)
+        image_filename = ""
+        try:
+            if image is not None:
+                suffix = Path(image.filename or "preview.png").suffix.lower()
+                if suffix not in STYLE_IMAGE_SUFFIXES:
+                    raise HTTPException(400, "风格预览图只支持 PNG、JPG 或 WebP")
+                image_filename = f"preview{suffix}"
+                image_path = style_dir / image_filename
+                with image_path.open("wb") as target:
+                    shutil.copyfileobj(image.file, target)
+                if image_path.stat().st_size > 15 * 1024 * 1024 or not valid_image_file(image_path):
+                    raise HTTPException(400, "风格预览图无效或超过 15MB")
+            now = time.time()
+            item = {
+                "id": style_id,
+                "name": name,
+                "aliases": [],
+                "description": description,
+                "recipe": recipe,
+                "image_filename": image_filename,
+                "deleted": False,
+                "created_at": now,
+                "updated_at": now,
+            }
+            items.append(item)
+            save_custom_styles(items)
+        except Exception:
+            shutil.rmtree(style_dir, ignore_errors=True)
+            raise
+    return style_snapshot(item)
+
+
+@app.patch("/api/styles/{style_id}")
+def update_style(style_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+    if not STYLE_ID_PATTERN.fullmatch(style_id):
+        raise HTTPException(404, "画面风格不存在")
+    with STYLE_LIBRARY_LOCK:
+        items = load_custom_styles()
+        item = next((candidate for candidate in items if candidate.get("id") == style_id), None)
+        definition = BUILTIN_STYLE_BY_ID.get(style_id)
+        if item is None and definition:
+            item = builtin_style_record(definition)
+            items.append(item)
+        if item is None:
+            raise HTTPException(404, "画面风格不存在")
+        name = normalized_style_name(payload.get("name", item.get("name")))
+        description = normalized_style_description(payload.get("description", item.get("description")))
+        recipe = normalized_style_recipe(payload.get("recipe", item.get("recipe")))
+        if len(name) < 2 or len(recipe) < 10:
+            raise HTTPException(400, "风格名称或配方长度不符合要求")
+        if style_name_conflicts(name, items, exclude_id=style_id):
+            raise HTTPException(409, "画面风格名称已经存在")
+        old_name = str(item.get("name") or "")
+        aliases = list(item.get("aliases") or [])
+        if old_name and old_name != name and old_name not in aliases:
+            aliases.append(old_name)
+        if definition and definition["name"] != name and definition["name"] not in aliases:
+            aliases.append(definition["name"])
+        item.update(name=name, aliases=aliases, description=description, recipe=recipe, updated_at=time.time())
+        save_custom_styles(items)
+    return style_snapshot(item)
+
+
+@app.delete("/api/styles/{style_id}")
+def delete_style(style_id: str) -> dict[str, Any]:
+    if not STYLE_ID_PATTERN.fullmatch(style_id):
+        raise HTTPException(404, "画面风格不存在")
+    if style_id in BUILTIN_STYLE_BY_ID:
+        raise HTTPException(409, "内置画面风格不可删除，只能编辑")
+    with STYLE_LIBRARY_LOCK:
+        items = load_custom_styles()
+        item = next((candidate for candidate in items if candidate.get("id") == style_id), None)
+        if item is None:
+            raise HTTPException(404, "画面风格不存在")
+        item["deleted"] = True
+        item["updated_at"] = time.time()
+        save_custom_styles(items)
+        shutil.rmtree(STYLES_DIR / style_id, ignore_errors=True)
+    return {"id": style_id, "deleted": True}
+
+
+@app.get("/api/styles/{style_id}/image")
+def get_style_image(style_id: str) -> FileResponse:
+    if not STYLE_ID_PATTERN.fullmatch(style_id):
+        raise HTTPException(404, "画面风格预览图不存在")
+    definition = BUILTIN_STYLE_BY_ID.get(style_id)
+    if definition:
+        image_path = builtin_style_image_path(definition)
+        if image_path is None:
+            raise HTTPException(404, "画面风格预览图不存在")
+        return FileResponse(
+            image_path,
+            media_type=mimetypes.guess_type(image_path.name)[0] or "image/png",
+            filename=image_path.name,
+            content_disposition_type="inline",
+        )
+    item = next((candidate for candidate in load_custom_styles() if candidate.get("id") == style_id), None)
+    if item is None:
+        raise HTTPException(404, "画面风格不存在")
+    filename = str(item.get("image_filename") or "")
+    path = STYLES_DIR / style_id / filename
+    if not filename or Path(filename).name != filename or not path.is_file():
+        raise HTTPException(404, "画面风格没有预览图")
+    return FileResponse(
+        path,
+        media_type=mimetypes.guess_type(filename)[0] or "image/png",
+        filename=filename,
+        content_disposition_type="inline",
+    )
+
+
+@app.get("/api/voices")
+def list_voices(search: str = "", page: int = 1, page_size: int = 20) -> dict[str, Any]:
+    return paginate_items(
+        list_voice_snapshots(),
+        search=search,
+        page=page,
+        page_size=page_size,
+        fields=("id", "name", "filename", "content_type"),
+    )
+
+
+@app.post("/api/voices")
+async def create_voice(name: str = Form(""), audio: UploadFile = File(...)) -> dict[str, Any]:
+    suffix = Path(audio.filename or "reference.wav").suffix.lower() or ".wav"
+    if suffix not in VOICE_AUDIO_SUFFIXES:
+        raise HTTPException(400, "音色只支持 WAV、MP3、M4A、AAC、FLAC、OGG 或 WebM")
+    voice_id = uuid.uuid4().hex[:12]
+    voice_dir = VOICES_DIR / voice_id
+    audio_path = voice_dir / f"reference{suffix}"
+    try:
+        voice_dir.mkdir(parents=True, exist_ok=False)
+        with audio_path.open("wb") as target:
+            shutil.copyfileobj(audio.file, target)
+        if audio_path.stat().st_size > 100 * 1024 * 1024 or not valid_media_file(audio_path):
+            raise HTTPException(400, "音色文件无效或超过 100MB")
+        metadata = {
+            "id": voice_id,
+            "name": normalized_voice_name(name, audio.filename or ""),
+            "filename": audio_path.name,
+            "created_at": time.time(),
+        }
+        atomic_write_json(voice_dir / "voice.json", metadata)
+        return voice_snapshot(metadata, audio_path)
+    except HTTPException:
+        shutil.rmtree(voice_dir, ignore_errors=True)
+        raise
+    except (OSError, ValueError) as exc:
+        shutil.rmtree(voice_dir, ignore_errors=True)
+        raise HTTPException(500, f"保存音色失败：{exc}") from exc
+
+
+@app.patch("/api/voices/{voice_id}")
+def rename_voice(voice_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+    metadata, audio_path = voice_record(voice_id)
+    name = normalized_voice_name(payload.get("name"), "")
+    if name == "未命名音色" and not str(payload.get("name") or "").strip():
+        raise HTTPException(400, "音色名称不能为空")
+    metadata["name"] = name
+    try:
+        atomic_write_json(voice_metadata_path(voice_id), metadata)
+    except OSError as exc:
+        raise HTTPException(500, f"重命名音色失败：{exc}") from exc
+    return voice_snapshot(metadata, audio_path)
+
+
+@app.delete("/api/voices/{voice_id}")
+def delete_voice(voice_id: str) -> dict[str, Any]:
+    voice_record(voice_id)
+    voice_dir = (VOICES_DIR / voice_id).resolve()
+    if voice_dir.parent != VOICES_DIR.resolve():
+        raise HTTPException(404, "音色不存在")
+    try:
+        shutil.rmtree(voice_dir)
+    except OSError as exc:
+        raise HTTPException(500, f"删除音色失败：{exc}") from exc
+    return {"id": voice_id, "deleted": True}
+
+
+@app.get("/api/voices/{voice_id}/audio")
+def get_voice_audio(voice_id: str) -> FileResponse:
+    metadata, audio_path = voice_record(voice_id)
+    return FileResponse(
+        audio_path,
+        media_type=mimetypes.guess_type(audio_path.name)[0] or "audio/wav",
+        filename=str(metadata.get("filename") or audio_path.name),
+    )
+
+
 @app.post("/api/jobs")
 async def create_job(
     request: Request,
     script: str = Form(..., alias="copy"),
     style: str = Form("极简粗线简笔白板风"),
+    aspect_ratio: str = Form(DEFAULT_ASPECT_RATIO),
     scenes_per_image: int = Form(1),
     task_name: str = Form(""),
     pen_text: str = Form(""),
     include_key_text: bool = Form(True),
     include_subtitles: bool = Form(True),
     stroke_detail: str = Form("detailed"),
-    reference: UploadFile = File(...),
+    reference: UploadFile | None = File(None),
+    voice_id: str = Form(""),
     reference_mode: str = Form("standard"),
     character_manifest: str = Form("[]"),
     style_reference: UploadFile | None = File(None),
@@ -2470,13 +3478,25 @@ async def create_job(
         pending = sum(1 for item in JOBS.values() if item.get("status") in {"queued", "running"})
     if pending >= MAX_ACTIVE_AND_QUEUED:
         raise HTTPException(429, f"当前已有 {pending} 个任务，请稍后再提交")
+    selected_voice_id = voice_id.strip()
+    selected_voice_metadata: dict[str, Any] | None = None
+    selected_voice_path: Path | None = None
+    if selected_voice_id:
+        selected_voice_metadata, selected_voice_path = voice_record(selected_voice_id)
+    if reference is None and selected_voice_path is None:
+        raise HTTPException(400, "请上传参考音频或从音色库选择音色")
     job_id = uuid.uuid4().hex[:12]
     job_dir = JOBS_DIR / job_id
     job_dir.mkdir(parents=True, exist_ok=True)
-    suffix = Path(reference.filename or "reference.wav").suffix or ".wav"
-    reference_path = job_dir / f"reference{suffix}"
-    with reference_path.open("wb") as target:
-        shutil.copyfileobj(reference.file, target)
+    if reference is not None:
+        suffix = Path(reference.filename or "reference.wav").suffix or ".wav"
+        reference_path = job_dir / f"reference{suffix}"
+        with reference_path.open("wb") as target:
+            shutil.copyfileobj(reference.file, target)
+    else:
+        suffix = selected_voice_path.suffix or ".wav"
+        reference_path = job_dir / f"reference{suffix}"
+        shutil.copy2(selected_voice_path, reference_path)
     reference_mode = reference_mode if reference_mode in {"custom", "infographic"} else "standard"
     visual_references: dict[str, Any] = {}
     if reference_mode == "custom":
@@ -2538,6 +3558,7 @@ async def create_job(
             shutil.rmtree(job_dir, ignore_errors=True)
             raise HTTPException(400, "风格参考图无效或超过 15MB")
         visual_references = {"style_image": style_path.name, "characters": saved_characters}
+    aspect_ratio = normalize_aspect_ratio(aspect_ratio)
     scenes_per_image = max(1, min(4, scenes_per_image))
     stroke_detail = stroke_detail if stroke_detail in {"light", "standard", "detailed", "full"} else "detailed"
     task_name = normalized_task_name(task_name, script, job_id)
@@ -2548,9 +3569,10 @@ async def create_job(
             "created_at": now, "started_at": now, "timings": {},
             "queue_stage": "voice", "queue_order": time.time_ns(),
             "client_ip": request_client_ip(request),
-            "job_type": "infographic" if reference_mode == "infographic" else "generate", "style": style, "scenes_per_image": scenes_per_image,
+            "job_type": "infographic" if reference_mode == "infographic" else "generate", "style": style, "aspect_ratio": aspect_ratio, "scenes_per_image": scenes_per_image,
             "pipeline_version": PIPELINE_VERSION if reference_mode == "infographic" else "standard_v1",
             "reference_mode": reference_mode, "character_count": len(visual_references.get("characters", [])),
+            "voice_id": selected_voice_id, "voice_name": str((selected_voice_metadata or {}).get("name") or ""),
             "visual_references": visual_references,
             "task_name": task_name,
             "copy": script.strip(),
@@ -2566,10 +3588,60 @@ async def create_job(
 
 
 @app.get("/api/jobs")
-def list_jobs(limit: int = 20) -> dict[str, Any]:
+def list_jobs(
+    limit: int = 20,
+    search: str = "",
+    page: int = 1,
+    page_size: int | None = None,
+) -> dict[str, Any]:
     with LOCK:
-        ids = sorted(JOBS, key=lambda item: float(JOBS[item].get("created_at", 0)), reverse=True)[:max(1, min(100, limit))]
-    return {"items": [job_snapshot(job_id) for job_id in ids]}
+        ids = sorted(JOBS, key=lambda item: float(JOBS[item].get("created_at", 0)), reverse=True)
+    snapshots = [job_snapshot(job_id) for job_id in ids if job_id in JOBS]
+    return paginate_items(
+        snapshots,
+        search=search,
+        page=page,
+        page_size=page_size if page_size is not None else limit,
+        fields=("id", "task_name", "copy", "style", "status", "stage", "error", "voice_name"),
+    )
+
+
+@app.delete("/api/jobs/{job_id}")
+def delete_job(job_id: str) -> dict[str, Any]:
+    if not re.fullmatch(r"[A-Za-z0-9_-]+", job_id):
+        raise HTTPException(404, "历史任务不存在")
+    job_dir = (JOBS_DIR / job_id).resolve()
+    if job_dir.parent != JOBS_DIR.resolve():
+        raise HTTPException(404, "历史任务不存在")
+    terminate_running_process(job_id)
+    with RUNNING_PROCESSES_LOCK:
+        process = RUNNING_PROCESSES.get(job_id)
+        if process is not None and process.poll() is None:
+            raise HTTPException(409, "任务仍在停止，请稍后再删除")
+    with LOCK:
+        item = JOBS.get(job_id)
+        if item is None:
+            raise HTTPException(404, "历史任务不存在")
+        if item.get("status") in {"queued", "running"}:
+            raise HTTPException(400, "排队中或制作中的任务请先取消")
+        output_path = recorded_output_path(item, job_id)
+        DELETED_JOB_IDS.add(job_id)
+        del JOBS[job_id]
+    try:
+        if job_dir.exists():
+            shutil.rmtree(job_dir)
+    except OSError as exc:
+        with LOCK:
+            JOBS[job_id] = item
+            DELETED_JOB_IDS.discard(job_id)
+        raise HTTPException(500, f"删除历史文件失败：{exc}") from exc
+    output_deleted = True
+    if output_path is not None:
+        try:
+            output_path.unlink(missing_ok=True)
+        except OSError:
+            output_deleted = False
+    return {"id": job_id, "deleted": True, "output_deleted": output_deleted}
 
 
 @app.post("/api/jobs/{job_id}/cancel")
@@ -2663,6 +3735,7 @@ def get_job_parameters(job_id: str) -> dict[str, Any]:
         "copy": str(source.get("copy") or ""),
         "reference_mode": reference_mode,
         "style": str(source.get("style") or DEFAULT_STYLE),
+        "aspect_ratio": normalize_aspect_ratio(selected.get("aspect_ratio", source.get("aspect_ratio"))),
         "scenes_per_image": max(1, min(4, int(source.get("scenes_per_image", 1)))),
         "task_name": str(selected.get("task_name") or source.get("task_name") or ""),
         "pen_text": str(selected.get("pen_text", source.get("pen_text", ""))),
@@ -2696,7 +3769,14 @@ def get_job_input_asset(job_id: str, filename: str) -> FileResponse:
     path = JOBS_DIR / job_id / filename
     if not path.is_file():
         raise HTTPException(404, "素材不存在")
-    return FileResponse(path, media_type=mimetypes.guess_type(filename)[0] or "application/octet-stream", filename=filename)
+    media_type = mimetypes.guess_type(filename)[0] or "application/octet-stream"
+    disposition = "inline" if media_type.startswith("image/") else "attachment"
+    return FileResponse(
+        path,
+        media_type=media_type,
+        filename=filename,
+        content_disposition_type=disposition,
+    )
 
 
 @app.get("/api/jobs/{job_id}/gallery")
@@ -2847,6 +3927,7 @@ def create_rerender(job_id: str, payload: dict[str, Any], request: Request) -> d
             "queue_stage": "render", "queue_order": time.time_ns(),
             "client_ip": request_client_ip(request),
             "job_type": "rerender", "rerender_of": job_id, "style": source.get("style", ""),
+            "aspect_ratio": normalize_aspect_ratio(source.get("aspect_ratio")),
             "reference_mode": source.get("reference_mode", "standard"),
             "pipeline_version": PIPELINE_VERSION if is_infographic_job(job_id) else source.get("pipeline_version", "standard_v1"),
             "task_name": task_name,
@@ -2881,7 +3962,9 @@ def download_job(job_id: str) -> FileResponse:
     result_name = str(item.get("result_file") or "final.mp4")
     if result_name not in {"final.mp4", "final-remotion-v1.mp4"}:
         raise HTTPException(404, "视频文件记录无效")
-    path = JOBS_DIR / job_id / result_name
-    if not path.exists():
+    path = recorded_output_path(item, job_id)
+    if path is None or not path.is_file():
+        path = JOBS_DIR / job_id / result_name
+    if not path.is_file():
         raise HTTPException(404, "视频尚未生成")
     return FileResponse(path, media_type="video/mp4", filename=f"whiteboard-{job_id}.mp4")

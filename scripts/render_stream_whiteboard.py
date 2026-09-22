@@ -25,6 +25,7 @@ import datetime
 import json
 import math
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 
 import cv2
@@ -60,6 +61,85 @@ def _frame_progress_indices(n_steps: int, target_frames: int) -> list[int]:
     if target_frames == 1:
         return [n_steps - 1]
     return [round(f * (n_steps - 1) / (target_frames - 1)) for f in range(target_frames)]
+
+
+@dataclass(frozen=True)
+class StrokeGroupPlan:
+    strokes: list[list[tuple[int, int]]]
+    draw_frames: int
+    pause_frames: int
+
+
+def _stroke_length(stroke: list[tuple[int, int]]) -> float:
+    return sum(
+        math.hypot(curr[0] - prev[0], curr[1] - prev[1])
+        for prev, curr in zip(stroke, stroke[1:])
+    )
+
+
+def _stroke_turn_score(stroke: list[tuple[int, int]]) -> float:
+    """返回累计转角，转折越多，绘制权重越高。"""
+    if len(stroke) < 3:
+        return 0.0
+    score = 0.0
+    for prev, current, nxt in zip(stroke, stroke[1:], stroke[2:]):
+        first = (current[0] - prev[0], current[1] - prev[1])
+        second = (nxt[0] - current[0], nxt[1] - current[1])
+        first_len = math.hypot(*first)
+        second_len = math.hypot(*second)
+        if first_len <= 1e-6 or second_len <= 1e-6:
+            continue
+        cosine = (first[0] * second[0] + first[1] * second[1]) / (first_len * second_len)
+        score += math.acos(max(-1.0, min(1.0, cosine)))
+    return score
+
+
+def _stroke_weight(stroke: list[tuple[int, int]], turn_weight: float) -> float:
+    length = _stroke_length(stroke)
+    turns = _stroke_turn_score(stroke)
+    return max(1.0, length + turns * max(0.0, turn_weight) * 12.0 + 8.0)
+
+
+def _allocate_weighted_frames(
+    weights: list[float], total_frames: int, max_each: int | None = None
+) -> list[int]:
+    """按复杂度分配整数帧，并用最大余数法保持总帧数不变。"""
+    if not weights or total_frames <= 0:
+        return [0 for _ in weights]
+    allocations = [0 for _ in weights]
+    available = total_frames
+    if max_each is not None:
+        max_each = max(0, max_each)
+    total_weight = sum(max(0.0, weight) for weight in weights) or float(len(weights))
+    raw = [available * max(0.0, weight) / total_weight for weight in weights]
+    allocations = [int(value) for value in raw]
+    if max_each is not None:
+        allocations = [min(value, max_each) for value in allocations]
+    if total_frames >= len(allocations):
+        for index in range(len(allocations)):
+            if allocations[index] == 0:
+                allocations[index] = 1
+    used = sum(allocations)
+    order = sorted(range(len(weights)), key=lambda index: raw[index] - int(raw[index]), reverse=True)
+    while used < available:
+        changed = False
+        for index in order:
+            if max_each is not None and allocations[index] >= max_each:
+                continue
+            allocations[index] += 1
+            used += 1
+            changed = True
+            if used >= available:
+                break
+        if not changed:
+            break
+    while used > available:
+        index = max(range(len(allocations)), key=lambda item: allocations[item])
+        if allocations[index] <= 0:
+            break
+        allocations[index] -= 1
+        used -= 1
+    return allocations
 
 
 # ──────────────────────────────────────────────────────────────
@@ -116,10 +196,12 @@ class RegionStreamRenderer:
         # 背景染成画布底色，让上色阶段背景与起笔一致（不碰墨迹）
         if cfg.match_bg and not self.dark_mode:
             self._match_original_background()
+        self.color_img_float = self.color_img.astype(np.float32)
 
         # 共享持久画布
         self.drawn = np.empty((self.out_h, self.out_w, 3), dtype=np.float32)
         self.drawn[...] = self.canvas_bgr.astype(np.float32)
+        self.frame_u8 = np.empty_like(self.color_img)
 
         # 笔尖覆盖
         self.tip: sr.TipOverlay | None = None
@@ -149,10 +231,16 @@ class RegionStreamRenderer:
         return (c * e + e // 2, r * e + e // 2)
 
     def _snapshot_with_tip(self, px: int, py: int) -> np.ndarray:
-        snap = self.drawn.astype(np.uint8)
+        np.copyto(self.frame_u8, self.drawn, casting="unsafe")
+        snap = self.frame_u8
         if self.tip is not None:
             self.tip.stamp(snap, px, py)
         return snap
+
+    def _snapshot(self) -> np.ndarray:
+        """把浮点画布转换到可复用的视频帧缓冲，避免每帧分配新数组。"""
+        np.copyto(self.frame_u8, self.drawn, casting="unsafe")
+        return self.frame_u8
 
     # ── 单区域的允许掩码：矩形 - 后续区域 - protectedRegions ──
     def _allowed_mask(self, element: dict, later_elements: list[dict]) -> np.ndarray:
@@ -204,15 +292,71 @@ class RegionStreamRenderer:
             reverse=True,
         )
         selected = out[:self.max_skeleton_strokes] if self.max_skeleton_strokes else out
-        return sr._order_skeleton_strokes(selected)
+        return self._order_strokes_continuously(selected)
+
+    @staticmethod
+    def _order_strokes_continuously(
+        strokes: list[list[tuple[int, int]]],
+    ) -> list[list[tuple[int, int]]]:
+        """按上一笔的末端选择最近的下一笔，减少断笔之间的远距离跳跃。"""
+        remaining = [list(stroke) for stroke in strokes if stroke]
+        if len(remaining) <= 1:
+            return remaining
+
+        first_index = min(
+            range(len(remaining)),
+            key=lambda index: (
+                min(point[1] for point in remaining[index]),
+                min(point[0] for point in remaining[index]),
+                -len(remaining[index]),
+            ),
+        )
+        ordered = [remaining.pop(first_index)]
+        tail = ordered[0][-1]
+        while remaining:
+            index, reverse = min(
+                (
+                    (index, reverse)
+                    for index, stroke in enumerate(remaining)
+                    for reverse in (False, True)
+                ),
+                key=lambda item: (
+                    (remaining[item[0]][-1 if item[1] else 0][0] - tail[0]) ** 2
+                    + (remaining[item[0]][-1 if item[1] else 0][1] - tail[1]) ** 2,
+                    -len(remaining[item[0]]),
+                ),
+            )
+            stroke = remaining.pop(index)
+            if reverse:
+                stroke.reverse()
+            ordered.append(stroke)
+            tail = stroke[-1]
+        return ordered
 
     # ── 落墨（限制在 allowed 内）──
     def _reveal_ink_segment(self, a: tuple[int, int], b: tuple[int, int], allowed: np.ndarray) -> None:
-        seg = np.zeros((self.out_h, self.out_w), dtype=np.uint8)
         thick = max(1, self.cfg.ink_reveal_radius * 2 + 1)
-        cv2.line(seg, a, b, 255, thickness=thick, lineType=cv2.LINE_AA)
-        revealed = (seg > 0) & self.ink_pixels & allowed
-        self.drawn[revealed] = self.ink_paint[revealed]
+        padding = thick + 1
+        x0 = max(0, min(a[0], b[0]) - padding)
+        y0 = max(0, min(a[1], b[1]) - padding)
+        x1 = min(self.out_w, max(a[0], b[0]) + padding + 1)
+        y1 = min(self.out_h, max(a[1], b[1]) + padding + 1)
+        if x1 <= x0 or y1 <= y0:
+            return
+        segment = np.zeros((y1 - y0, x1 - x0), dtype=np.uint8)
+        cv2.line(
+            segment,
+            (a[0] - x0, a[1] - y0),
+            (b[0] - x0, b[1] - y0),
+            255,
+            thickness=thick,
+            lineType=cv2.LINE_AA,
+        )
+        ink_region = self.ink_pixels[y0:y1, x0:x1]
+        allowed_region = allowed[y0:y1, x0:x1]
+        revealed = (segment > 0) & ink_region & allowed_region
+        drawn_region = self.drawn[y0:y1, x0:x1]
+        drawn_region[revealed] = self.ink_paint[y0:y1, x0:x1][revealed]
 
     def _ink_stamp_cell(self, cell: tuple[int, int], allowed: np.ndarray) -> None:
         r, c = cell
@@ -236,9 +380,208 @@ class RegionStreamRenderer:
         m = disk[by0:by1, bx0:bx1] * allowed[y0:y1, x0:x1]
         inv = 1.0 - m
         target = self.drawn[y0:y1, x0:x1]
-        source = self.color_img[y0:y1, x0:x1].astype(np.float32)
+        source = self.color_img_float[y0:y1, x0:x1]
         for ch in range(3):
             target[:, :, ch] = target[:, :, ch] * inv + source[:, :, ch] * m
+
+    def _complete_region_color(self, allowed: np.ndarray) -> None:
+        """填色阶段收尾时补齐当前分镜，避免局部扫描留下空白。"""
+        self.drawn[allowed] = self.color_img_float[allowed]
+
+    @staticmethod
+    def _flatten_strokes(
+        strokes: list[list[tuple[int, int]]],
+    ) -> tuple[list[tuple[int, int]], set[int]]:
+        samples: list[tuple[int, int]] = []
+        pen_lifts: set[int] = set()
+        for stroke_index, stroke in enumerate(strokes):
+            if stroke_index > 0:
+                pen_lifts.add(len(samples))
+            samples.extend(stroke)
+        return samples, pen_lifts
+
+    def _group_strokes_for_budget(
+        self, strokes: list[list[tuple[int, int]]], group_count: int
+    ) -> list[list[list[tuple[int, int]]]]:
+        """先按空间邻近关系聚成对象，再按帧数合并相邻对象。"""
+        if not strokes:
+            return []
+        brush_radius = getattr(self.cfg, "brush_radius", 40)
+        gap = max(10, min(24, brush_radius // 2))
+        bboxes = []
+        for stroke in strokes:
+            xs = [point[0] for point in stroke]
+            ys = [point[1] for point in stroke]
+            bboxes.append((min(xs), min(ys), max(xs), max(ys)))
+
+        parents = list(range(len(strokes)))
+
+        def find(index: int) -> int:
+            while parents[index] != index:
+                parents[index] = parents[parents[index]]
+                index = parents[index]
+            return index
+
+        def union(left: int, right: int) -> None:
+            left_root = find(left)
+            right_root = find(right)
+            if left_root != right_root:
+                parents[right_root] = left_root
+
+        for left, (left_x0, left_y0, left_x1, left_y1) in enumerate(bboxes):
+            for right in range(left + 1, len(bboxes)):
+                right_x0, right_y0, right_x1, right_y1 = bboxes[right]
+                if (
+                    left_x0 - gap <= right_x1
+                    and right_x0 - gap <= left_x1
+                    and left_y0 - gap <= right_y1
+                    and right_y0 - gap <= left_y1
+                ):
+                    union(left, right)
+
+        natural: list[list[list[tuple[int, int]]]] = []
+        natural_indices: dict[int, int] = {}
+        for index, stroke in enumerate(strokes):
+            root = find(index)
+            group_index = natural_indices.setdefault(root, len(natural))
+            if group_index == len(natural):
+                natural.append([])
+            natural[group_index].append(stroke)
+
+        if len(natural) <= max(1, group_count):
+            return natural
+
+        groups = [list(group) for group in natural]
+        target_count = max(1, min(len(groups), group_count))
+        while len(groups) > target_count:
+            merge_index = min(
+                range(len(groups) - 1),
+                key=lambda index: _stroke_weight(groups[index][-1], self.cfg.stroke_turn_weight)
+                + _stroke_weight(groups[index + 1][0], self.cfg.stroke_turn_weight),
+            )
+            groups[merge_index].extend(groups.pop(merge_index + 1))
+        return groups
+
+    def _plan_stroke_groups(
+        self, strokes: list[list[tuple[int, int]]], total_frames: int
+    ) -> list[StrokeGroupPlan]:
+        """为笔画组分配绘制帧与抬笔停顿帧。"""
+        if not strokes or total_frames <= 0:
+            return []
+        mode = self.cfg.pause_mode
+        if mode == "off":
+            pause_ratio = 0.0
+        elif mode == "light":
+            pause_ratio = self.cfg.stroke_pause_ratio_light
+        elif mode == "auto":
+            frames_per_stroke = total_frames / max(1, len(strokes))
+            pause_ratio = (
+                self.cfg.stroke_pause_ratio_heavy
+                if frames_per_stroke >= 2.5
+                else self.cfg.stroke_pause_ratio_light
+                if frames_per_stroke >= 1.5
+                else 0.0
+            )
+        else:
+            pause_ratio = self.cfg.stroke_pause_ratio_heavy
+
+        pause_total = min(
+            round(total_frames * max(0.0, pause_ratio)),
+            max(0, total_frames - min(len(strokes), total_frames)),
+        )
+        draw_total = max(1, total_frames - pause_total)
+        group_count = min(len(strokes), draw_total)
+        groups = self._group_strokes_for_budget(strokes, group_count)
+        weights = [
+            sum(_stroke_weight(stroke, self.cfg.stroke_turn_weight) for stroke in group)
+            for group in groups
+        ]
+        pause_weights = [
+            sum(_stroke_turn_score(stroke) + 1.0 for stroke in group)
+            for group in groups
+        ]
+        pause_allocations = _allocate_weighted_frames(
+            pause_weights,
+            pause_total,
+            max_each=max(1, self.cfg.stroke_pause_max_frames),
+        )
+        actual_pause = sum(pause_allocations)
+        draw_allocations = _allocate_weighted_frames(weights, total_frames - actual_pause)
+        return [
+            StrokeGroupPlan(group, draw_frames, pause_frames)
+            for group, draw_frames, pause_frames in zip(
+                groups, draw_allocations, pause_allocations
+            )
+        ]
+
+    def _path_progress_indices(
+        self,
+        samples: list[tuple[int, int]],
+        pen_lifts: set[int],
+        target_frames: int,
+    ) -> list[int]:
+        """沿路径弧长推进，转角位置降低速度而不是匀速跳过。"""
+        if not samples or target_frames <= 0:
+            return []
+        if len(samples) == 1:
+            return [0 for _ in range(target_frames)]
+        cumulative = [0.0]
+        for index in range(1, len(samples)):
+            if index in pen_lifts:
+                cumulative.append(cumulative[-1])
+                continue
+            previous = samples[index - 1]
+            current = samples[index]
+            distance = math.hypot(current[0] - previous[0], current[1] - previous[1])
+            turn = 0.0
+            if index + 1 < len(samples) and index + 1 not in pen_lifts:
+                before = (current[0] - previous[0], current[1] - previous[1])
+                after = (samples[index + 1][0] - current[0], samples[index + 1][1] - current[1])
+                before_len = math.hypot(*before)
+                after_len = math.hypot(*after)
+                if before_len > 1e-6 and after_len > 1e-6:
+                    cosine = (before[0] * after[0] + before[1] * after[1]) / (before_len * after_len)
+                    turn = math.acos(max(-1.0, min(1.0, cosine))) / math.pi
+            cumulative.append(
+                cumulative[-1] + distance * (1.0 + turn * self.cfg.stroke_turn_weight)
+            )
+        total = cumulative[-1]
+        if total <= 1e-6:
+            return _frame_progress_indices(len(samples), target_frames)
+        indices: list[int] = []
+        for frame in range(target_frames):
+            target = total * frame / max(1, target_frames - 1)
+            index = 0
+            while index < len(cumulative) - 1 and cumulative[index] < target:
+                index += 1
+            indices.append(index)
+        return indices
+
+    def _lay_ink_strokes(
+        self,
+        writer,
+        frames: int,
+        strokes: list[list[tuple[int, int]]],
+        allowed: np.ndarray,
+    ) -> None:
+        """按笔画组逐段落墨，抬笔时只移动笔尖不留下墨迹。"""
+        previous_tail: tuple[int, int] | None = None
+        for plan in self._plan_stroke_groups(strokes, frames):
+            first_point = plan.strokes[0][0]
+            for pause_index in range(plan.pause_frames):
+                if previous_tail is None:
+                    point = first_point
+                else:
+                    progress = (pause_index + 1) / plan.pause_frames
+                    eased = sr._ease_in_out_sine(progress)
+                    point = (
+                        round(previous_tail[0] + (first_point[0] - previous_tail[0]) * eased),
+                        round(previous_tail[1] + (first_point[1] - previous_tail[1]) * eased),
+                    )
+                writer.write(self._snapshot_with_tip(*point))
+            samples, pen_lifts = self._flatten_strokes(plan.strokes)
+            self._lay_ink(writer, plan.draw_frames, samples, pen_lifts, allowed)
+            previous_tail = plan.strokes[-1][-1]
 
     # ── 起笔段（骨架模式）：沿笔迹逐段揭原图墨迹，无块填充 ──
     def _lay_ink(self, writer, frames: int, samples: list[tuple[int, int]],
@@ -250,7 +593,7 @@ class RegionStreamRenderer:
             for _ in range(frames):
                 writer.write(self._snapshot_with_tip(self.out_w // 2, self.out_h // 2))
             return
-        idx_for_frame = _frame_progress_indices(n, frames)
+        idx_for_frame = self._path_progress_indices(samples, pen_lifts, frames)
         last: int | None = None
         for si in idx_for_frame:
             if last is None:
@@ -283,8 +626,99 @@ class RegionStreamRenderer:
             else:
                 for k in range(last + 1, ci + 1):
                     self._color_stamp(*centers[k], disk, allowed)
-            writer.write(self.drawn.astype(np.uint8))
+            writer.write(self._snapshot())
             last = ci
+
+    def _paint_mask(self, allowed: np.ndarray) -> np.ndarray:
+        """提取当前分镜中真正有颜色的像素，排除黑色线稿。"""
+        canvas = self.canvas_bgr.astype(np.int16)
+        color_diff = np.abs(self.color_img.astype(np.int16) - canvas).sum(axis=2)
+        threshold = max(18, self.cfg.match_bg_threshold)
+        foreground = color_diff >= threshold
+        hsv = cv2.cvtColor(self.color_img, cv2.COLOR_BGR2HSV)
+        foreground &= hsv[:, :, 1] >= 40
+        ink = (self.ink_pixels.astype(np.uint8) * 255)
+        radius = max(1, min(2, self.cfg.brush_radius // 20))
+        kernel = cv2.getStructuringElement(
+            cv2.MORPH_ELLIPSE, (radius * 2 + 1, radius * 2 + 1)
+        )
+        line_guard = cv2.dilate(ink, kernel, iterations=1) > 0
+        return allowed & foreground & ~line_guard
+
+    def _paint_component_routes(
+        self, paint_mask: np.ndarray
+    ) -> list[tuple[np.ndarray, list[tuple[int, int]]]]:
+        """把颜色分成空间连通的对象，并为每个对象生成短往返笔触。"""
+        mask_u8 = paint_mask.astype(np.uint8) * 255
+        bridge = max(3, min(9, self.cfg.brush_radius // 5))
+        if bridge % 2 == 0:
+            bridge += 1
+        grouped = cv2.morphologyEx(
+            mask_u8,
+            cv2.MORPH_CLOSE,
+            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (bridge, bridge)),
+        )
+        count, labels, stats, _ = cv2.connectedComponentsWithStats(grouped, 8)
+        components: list[tuple[np.ndarray, list[tuple[int, int]], int, int, int]] = []
+        spacing = max(3, self.cfg.brush_radius // 2)
+        for label in range(1, count):
+            x, y, width, height, _ = stats[label]
+            component = paint_mask & (labels == label)
+            if int(component.sum()) < max(4, spacing):
+                continue
+            route: list[tuple[int, int]] = []
+            forward = True
+            for py in range(int(y), int(y + height), spacing):
+                row_xs = np.where(component[py])[0]
+                if row_xs.size == 0:
+                    continue
+                left = int(row_xs.min())
+                right = int(row_xs.max())
+                lane = list(range(left, right + 1, spacing))
+                if not lane or lane[-1] != right:
+                    lane.append(right)
+                if not forward:
+                    lane.reverse()
+                route.extend((px, int(py)) for px in lane)
+                forward = not forward
+            if not route:
+                ys, xs = np.where(component)
+                route = [(int(xs[len(xs) // 2]), int(ys[len(ys) // 2]))]
+            components.append((component, route, int(-component.sum()), int(y), int(x)))
+        components.sort(key=lambda item: (item[2], item[3], item[4]))
+        return [(component, route) for component, route, _, _, _ in components]
+
+    def _wash_paint(self, writer, frames: int, allowed: np.ndarray) -> None:
+        """逐个颜色对象用短往返笔触填色，而不是扫描整个分镜。"""
+        if frames <= 0:
+            return
+        paint_mask = self._paint_mask(allowed)
+        components = self._paint_component_routes(paint_mask)
+        if not components:
+            for _ in range(frames):
+                writer.write(self._snapshot())
+            return
+        disk = sr._feathered_disk(self.cfg.brush_radius)
+        allocations = _allocate_weighted_frames(
+            [len(route) for _, route in components], frames
+        )
+        emitted = 0
+        for (component, route), component_frames in zip(components, allocations):
+            if component_frames <= 0:
+                continue
+            indices = _frame_progress_indices(len(route), component_frames)
+            last: int | None = None
+            for route_index in indices:
+                if last is None:
+                    self._color_stamp(*route[route_index], disk, component)
+                else:
+                    for route_step in range(last + 1, route_index + 1):
+                        self._color_stamp(*route[route_step], disk, component)
+                emitted += 1
+                if emitted == frames:
+                    self.drawn[allowed] = self.color_img_float[allowed]
+                writer.write(self._snapshot_with_tip(*route[route_index]))
+                last = route_index
 
     def _wash_contour(self, writer, frames: int, allowed: np.ndarray) -> None:
         if frames <= 0:
@@ -322,7 +756,7 @@ class RegionStreamRenderer:
         blocks = max(1, cfg.wipe_blocks)
 
         allowed_crop = allowed[top:bottom + 1, left:right + 1]
-        color_crop = self.color_img[top:bottom + 1, left:right + 1].astype(np.float32)
+        color_crop = self.color_img_float[top:bottom + 1, left:right + 1]
         drawn_crop = self.drawn[top:bottom + 1, left:right + 1]
 
         for fi in range(frames):
@@ -338,7 +772,9 @@ class RegionStreamRenderer:
             cx = max(0, min(region_w - 1, cx))
             col = np.where(reveal[:, cx])[0]
             cy = int(col[-1]) if col.size > 0 else 0
-            writer.write(self.drawn.astype(np.uint8))
+            if fi == frames - 1:
+                drawn_crop[allowed_crop] = color_crop[allowed_crop]
+            writer.write(self._snapshot())
 
         # 收尾：确保区域内允许像素全部揭示
         drawn_crop[allowed_crop] = color_crop[allowed_crop]
@@ -385,7 +821,7 @@ class RegionStreamRenderer:
             n = int(round((until_ms - cur_ms) / ms_per_frame))
             if n <= 0:
                 return
-            snap = self.drawn.astype(np.uint8)
+            snap = self._snapshot()
             for _ in range(n):
                 writer.write(snap)
             cur_ms += n * ms_per_frame
@@ -398,25 +834,18 @@ class RegionStreamRenderer:
                 fill_static(start_ms)
 
                 allowed = self._allowed_mask(element, elements[idx + 1:])
-                # 混合绘制：手只负责约 32% 的主轮廓，细节无手淡入，剩余时间观看成图。
-                ink_frames = max(1, round(dur_ms * 0.32 * cfg.fps / 1000))
-                color_frames = max(1, round(dur_ms * 0.10 * cfg.fps / 1000))
+                # 严格分成两段：先画完整线稿，再独立进行颜色揭示。
+                ink_frames = max(1, round(dur_ms * 0.52 * cfg.fps / 1000))
+                color_frames = max(1, round(dur_ms * 0.28 * cfg.fps / 1000))
 
                 if cfg.ink_path_mode == "skeleton":
                     strokes = self._region_skeleton_strokes(allowed)
                     if strokes:
-                        samples, pen_lifts = [], set()
-                        for si, stroke in enumerate(strokes):
-                            if si > 0:
-                                pen_lifts.add(len(samples))
-                            samples.extend(stroke)
-                        self._lay_ink(writer, ink_frames, samples, pen_lifts, allowed)
-                        centers = samples
+                        self._lay_ink_strokes(writer, ink_frames, strokes, allowed)
                     else:
-                        # 骨架识别不到可靠线条时不让手沿网格乱扫；细节交给无手上色阶段。
                         for _ in range(ink_frames):
-                            writer.write(self.drawn.astype(np.uint8))
-                        centers = []
+                            writer.write(self._snapshot())
+                    centers = [point for stroke in strokes for point in stroke] if strokes else []
                 else:
                     path = self._region_grid_path(allowed)
                     if path:
@@ -425,27 +854,25 @@ class RegionStreamRenderer:
                         self._lay_ink_grid(writer, ink_frames, samples, pen_lifts, sample_cell, path, allowed)
                         centers = [self._cell_center(c) for c in path]
                     else:
-                        self._lay_ink(writer, ink_frames, [], set(), None, allowed)
+                        self._lay_ink(writer, ink_frames, [], set(), allowed)
                         centers = []
 
                 cur_ms += ink_frames * ms_per_frame
 
-                if cfg.color_fill == "contour-wipe":
+                if cfg.color_fill == "paint":
+                    self._wash_paint(writer, color_frames, allowed)
+                elif cfg.color_fill == "contour-wipe":
                     self._wash_contour(writer, color_frames, allowed)
                 else:
                     self._wash_brush(writer, color_frames, centers, allowed)
                 cur_ms += color_frames * ms_per_frame
-                # The last part of each board is a clean hold on the complete
-                # generated image. This guarantees that even a short final
-                # narration segment ends on the finished artwork.
-                if idx == len(elements) - 1:
-                    self.drawn[...] = self.color_img.astype(np.float32)
+                self._complete_region_color(allowed)
                 fill_static(start_ms + dur_ms)
 
             # Never extend a board past its allocated narration time. The old
             # extra 0.5s per board accumulated and let audio truncate the last
             # image before it appeared.
-            self.drawn[...] = self.color_img.astype(np.float32)
+            self.drawn[...] = self.color_img_float
             fill_static(total_ms)
         finally:
             writer.release()
@@ -493,8 +920,8 @@ def _parse_args(argv=None):
     p.add_argument("--bare-tip", action="store_true", help="不叠加笔尖/手部")
     p.add_argument("--ink-path", default="grid", choices=["grid", "skeleton"],
                    help="笔迹路径: grid 网格(默认); skeleton 骨架追踪")
-    p.add_argument("--color-fill", default="contour-wipe", choices=["contour-wipe", "brush"],
-                   help="上色: contour-wipe 轮廓扫描(默认); brush 沿轨迹刷")
+    p.add_argument("--color-fill", default="paint", choices=["paint", "contour-wipe", "brush"],
+                   help="上色: paint 画笔往返填充(默认); contour-wipe 轮廓扫描; brush 沿轨迹刷")
     p.add_argument("--pause", default="heavy", choices=["heavy", "auto", "light", "off"],
                    help="起笔段停顿节奏（预留，逐区域画法下影响较弱）")
     p.add_argument("--fps", type=int, default=None)
@@ -505,6 +932,8 @@ def _parse_args(argv=None):
     p.add_argument("--stroke-detail", default="detailed",
                    choices=["light", "standard", "detailed", "full"],
                    help="手绘线条量: light 24条; standard 48条; detailed 96条; full 全部")
+    p.add_argument("--keep-raw", action="store_true",
+                   help="保留渲染器的 mp4v 中间视频，交给最终音画合成阶段统一转码")
     return p.parse_args(argv)
 
 
@@ -566,7 +995,10 @@ def main(argv=None) -> int:
           f"笔迹: {cfg.ink_path_mode}, 线条量: {args.stroke_detail}, 上色: {cfg.color_fill}")
 
     renderer.render_to(raw_path, total_ms)
-    final = sr.transcode_h264(raw_path, out_path)
+    final = raw_path if args.keep_raw else sr.transcode_h264(raw_path, out_path)
+    if args.keep_raw:
+        raw_path.replace(out_path)
+        final = out_path
 
     size_mb = final.stat().st_size / (1024 * 1024)
     print(f"\n最终视频: {final}  ({size_mb:.2f} MB)")
